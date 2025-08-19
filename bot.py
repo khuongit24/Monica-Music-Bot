@@ -64,7 +64,6 @@ def save_playlists():
     except Exception as e:
         logger.exception("Error saving playlists.json: %s", e)
 
-# --- Music player ---
 class YTDLSource(discord.PCMVolumeTransformer):
     def __init__(self, source, *, data, volume=0.5):
         super().__init__(source, volume)
@@ -73,12 +72,12 @@ class YTDLSource(discord.PCMVolumeTransformer):
         self.webpage_url = data.get("webpage_url")
         self.thumbnail = data.get("thumbnail")
         self.uploader = data.get("uploader")
-        self.duration = data.get("duration")  # seconds
+        self.duration = data.get("duration")  
 
     @classmethod
     async def from_url(cls, url, *, loop=None, stream=True):
         loop = loop or asyncio.get_event_loop()
-        try:  # Thêm try để catch cụ thể yt_dlp errors, tránh broad exception
+        try:  
             data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=not stream))
             if data is None:
                 raise RuntimeError("Không thể lấy thông tin từ nguồn")
@@ -111,9 +110,8 @@ class MusicPlayer:
             while True:
                 self.next.clear()
                 try:
-                    self.current = await asyncio.wait_for(self.queue.get(), timeout=300)  # Thêm timeout để tránh wait mãi nếu queue idle lâu, giúp tiết kiệm resource
+                    self.current = await asyncio.wait_for(self.queue.get(), timeout=300)  
                 except asyncio.TimeoutError:
-                    # Nếu queue empty lâu, tự destroy player để tối ưu memory
                     await self.text_channel.send("Hàng đợi trống quá lâu, tui dừng player để tiết kiệm năng lượng nhé!")
                     self.destroy()
                     return
@@ -134,7 +132,7 @@ class MusicPlayer:
 
                 vc.play(source, after=lambda e: self.bot.loop.call_soon_threadsafe(self.next.set))
                 vc.source = source
-                vc.source.volume = self.volume  # Đảm bảo volume sync ngay, tránh race condition
+                vc.source.volume = self.volume 
                 self.started_at = time.time()
                 try:
                     embed = make_now_playing_embed(source)
@@ -144,7 +142,6 @@ class MusicPlayer:
                     logger.exception("Không thể gửi tin nhắn Now-Playing: %s", e)
 
                 await self.next.wait()
-                # Sau khi chơi xong, check nếu queue empty thì prepare destroy (tối ưu)
                 if self.queue.empty() and not vc.is_playing():
                     self.destroy()
                     return
@@ -155,7 +152,6 @@ class MusicPlayer:
 
     def destroy(self):
         self._task.cancel()
-        # Thêm cleanup: clear queue để tránh memory leak nhỏ
         while not self.queue.empty():
             self.queue.get_nowait()
 
@@ -168,7 +164,6 @@ def get_player(ctx) -> MusicPlayer:
         players[ctx.guild.id] = player
     return player
 
-# --- Helper: create embed cards ---
 def format_duration(sec: typing.Optional[int]) -> str:
     if not sec:
         return "Unknown"
@@ -192,7 +187,6 @@ def make_now_playing_embed(source: YTDLSource) -> discord.Embed:
     embed.set_footer(text="Monica Bot • By shio")
     return embed
 
-# --- Interactive controls (buttons) ---
 class MusicControls(ui.View):
     def __init__(self, guild_id: int, *, timeout: float = 300):
         super().__init__(timeout=timeout)
@@ -255,10 +249,9 @@ class MusicControls(ui.View):
         embed = discord.Embed(title="Queue (next up)", description=text, color=0x2F3136)
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-# --- Utility command fetcher ---
 async def fetch_info(search: str):
     loop = bot.loop
-    try:  # Thêm try để handle specific errors, cải thiện stability
+    try:  
         data = await loop.run_in_executor(None, lambda: ytdl.extract_info(search, download=False))
         if data is None:
             raise RuntimeError("Không tìm thấy kết quả.")
@@ -287,13 +280,12 @@ async def on_ready():
 async def on_voice_state_update(member, before, after):
     if member.id != bot.user.id:
         return
-    if before.channel and not after.channel:  # Bot bị disconnect
+    if before.channel and not after.channel:  
         player = players.pop(before.channel.guild.id, None)
         if player:
             player.destroy()
             logger.info("Player destroyed due to voice disconnect")
 
-# Các commands còn lại giữ nguyên, vì chúng đã ổn định. Chỉ thêm on_voice_state_update để handle disconnect graceful.
 
 @tree.command(name="join", description="Để gọi bot vào kênh thoại của bạn")
 async def slash_join(interaction: discord.Interaction):
