@@ -1,4 +1,4 @@
-# Discord Music Bot (ver_1.0_release)
+# Discord Music Bot (Monica)
 
 Bot discord dùng để phát nhạc.
 
