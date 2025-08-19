@@ -1,0 +1,9 @@
+version: "3.8"
+services:
+  musicbot:
+    build: .
+    environment:
+      - DISCORD_TOKEN=${DISCORD_TOKEN}
+    volumes:
+      - ./playlists.json:/app/playlists.json
+    restart: unless-stopped
