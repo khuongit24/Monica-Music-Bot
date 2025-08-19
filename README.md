@@ -40,5 +40,4 @@ Bot discord dùng để phát nhạc.
    docker compose up -d --build
 
 ## Lưu ý
-- Khuyến khích chỉ dùng cho server riêng tư.
-- Bot này cung cấp công cụ kỹ thuật để phát luồng audio, trách nhiệm tuân thủ luật bản quyền thuộc về người dùng.
+- Free Source, không sử dụng với mục đích thương mại, không chịu trách nhiệm trước bất kỳ pháp lý nào.
