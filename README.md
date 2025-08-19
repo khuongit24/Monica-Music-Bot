@@ -1,7 +1,6 @@
 # Discord Music Bot (ver_1.0_release)
 
-Đây là phiên bản chính thức ver_1.0_release cho Discord Music Bot, hoàn thiện hơn so với bản pre_release.
-Mục đích: sử dụng cá nhân trong server riêng tư (không thương mại).
+Bot discord dùng để phát nhạc.
 
 ## Tính năng chính
 - Hỗ trợ Slash commands và fallback prefix commands
@@ -35,19 +34,11 @@ Mục đích: sử dụng cá nhân trong server riêng tư (không thương m�
 4. Chạy bot
    python bot.py
 
-## Chạy bằng Docker (khuyến nghị cho sản phẩm ổn định)
+## Chạy bằng Docker
 1. Thiết lập biến môi trường DISCORD_TOKEN trên host
 2. Xây dựng và chạy:
    docker compose up -d --build
 
-## Lưu ý pháp lý và đạo đức
-- Mặc dù bạn cho biết dùng cho server riêng tư, hãy nhớ rằng việc stream nội dung có bản quyền từ các nguồn công cộng có thể chịu các quy định dịch vụ của nền tảng (ví dụ YouTube).
-- Bot này cung cấp công cụ kỹ thuật để phát luồng audio; trách nhiệm tuân thủ luật bản quyền thuộc về người dùng.
-
-## Tùy chỉnh & mở rộng (gợi ý)
-- Thêm chế độ shuffle, loop, repeat, hoặc quyền chỉ cho một role dùng lệnh quản lý.
-- Thêm cơ chế cache/local download để giảm tải network (cân nhắc bản quyền).
-- Chuyển toàn bộ logic thành cogs để bảo trì dễ dàng.
-
-## Hỗ trợ
-Mình đóng vai lập trình viên 10 năm — nếu cần mình bổ sung cogs, hệ thống DB (SQLite/Postgres) cho playlists, hoặc UI web để điều khiển, mình làm tiếp.
+## Lưu ý
+- Khuyến khích chỉ dùng cho server riêng tư.
+- Bot này cung cấp công cụ kỹ thuật để phát luồng audio, trách nhiệm tuân thủ luật bản quyền thuộc về người dùng.
