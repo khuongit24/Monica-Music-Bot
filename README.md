@@ -1,4 +1,4 @@
-# Monica Discord Music Bot v2.1 - Free Source - Free To Use
+# Monica Discord Music Bot - Free Source - Free To Use
 
 A Discord music bot project built for **personal use**.  
 ⚠️ This project is not intended for commercial purposes or mass distribution.  
