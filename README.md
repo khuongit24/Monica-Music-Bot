@@ -1,38 +1,19 @@
-# Discord Music Bot (Monica)
+# Monica Discord Music Bot v2.1 - Free Source - Free To Use
 
 Bot discord dùng để phát nhạc.
 
-## Tính năng chính
-- Hỗ trợ Slash commands và fallback prefix commands
-- Hệ thống hàng đợi (per-guild)
-- Lưu playlist persist vào `playlists.json`
-- Các lệnh phổ biến: join, leave, play, pause, resume, stop, skip, queue, now, volume, list_playlists, save_playlist, play_playlist, shutdown (owner only)
-- Dockerfile + docker-compose để triển khai nhanh trên VPS
-
 ## Yêu cầu
-- Python 3.10+ (khuyến nghị 3.11)
-- ffmpeg (trong Dockerfile đã cài sẵn nếu dùng Docker image)
-- Token bot Discord (tạo trên Developer Portal) và quyền: Connect, Speak, Send Messages, Use Application Commands
+- Đã cài sẵn Python 3.10+ (khuyến nghị 3.11)
+- Đã cài ffmpeg (trong Dockerfile đã cài sẵn nếu dùng Docker image). Bạn không biết cài thì tìm google cách cài hai thứ này nhé. Dễ lắm 👌
+- Token bot Discord (tạo trên Developer Application Portal) và tạo Bot trên đó. Tương tự như trên, bạn không biết thì xem youtube cách tạo app trên discord portal nhé, sau đó quay lại đây
 
 ## Cài đặt nhanh (cục bộ)
-1. Tạo virtualenv
-   python -m venv venv
-   source venv/bin/activate   # Linux / macOS
-   venv\Scripts\activate    # Windows PowerShell
+1. Chỉnh file config.json và điền token(Token Discord Application - bắt buộc, không có thì bot không chạy được đâu):
+   {"token": "Điền token app của bạn vào đây", "prefix": "!", }
+2. Cài dependencies pip install -r requirements.txt
+3. Mở Terminal gõ cd + đường dẫn chứa bot
+4. Gõ python bot.py và enter chạy thôi
 
-2. Cài dependencies
-   pip install -r requirements.txt
-
-3. Tạo file cấu hình
-   Sao chép config.json.example thành config.json và điền token (và owner_id nếu muốn):
-   {
-     "token": "YOUR_TOKEN",
-     "prefix": "!",
-     "owner_id": 123456789012345678
-   }
-
-4. Chạy bot
-   python bot.py
 
 ## Chạy bằng Docker
 1. Thiết lập biến môi trường DISCORD_TOKEN trên host
