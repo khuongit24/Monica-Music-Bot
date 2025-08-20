@@ -769,7 +769,7 @@ class MusicControls(ui.View):
             return False
         vc = discord.utils.get(bot.voice_clients, guild=interaction.guild)
         if not vc or not vc.is_connected():
-            await interaction.response.send_message("Bot chưa kết nối kênh thoại nào", ephemeral=True)
+            await interaction.response.send_message("Mình chưa kết nối kênh thoại nào cả :<", ephemeral=True)
             return False
         if interaction.user.voice.channel.id != vc.channel.id:
             await interaction.response.send_message("Bạn phải ở cùng kênh thoại với bot để điều khiển", ephemeral=True)
@@ -813,7 +813,7 @@ class MusicControls(ui.View):
     async def show_queue(self, inter: discord.Interaction, button: ui.Button):
         player = players.get(inter.guild.id)
         if not player or player.queue.empty():
-            await inter.response.send_message("Hàng đợi trống trơn", ephemeral=True); return
+            await inter.response.send_message("Hàng đợi đang trống, bạn thêm nhạc vào nhé ✨", ephemeral=True); return
         upcoming = player.queue.snapshot()[:10]
         text = "\n".join(
             f"{idx+1}. {truncate((item.get('title') if isinstance(item, dict) else str(item)), 50)} — {format_duration(item.get('duration') if isinstance(item, dict) else None)}"
@@ -854,7 +854,6 @@ async def on_ready():
     except Exception:
         logger.exception("Failed to sync commands")
     try:
-        # launch cache cleanup on the running loop
         asyncio.create_task(_cache_cleanup_loop())
     except Exception:
         pass
@@ -1179,12 +1178,12 @@ async def text_play_playlist(ctx, name: str):
             await user.voice.channel.connect()
         except Exception:
             logger.exception("Connect failed (text)")
-            await ctx.send("Không thể kết nối kênh thoại.")
+            await ctx.send("Không thể kết nối kênh thoại")
             return
     player = get_player_for_ctx(ctx.guild, ctx.channel)
     for item in PLAYLISTS[name]:
         await player.add_track(item)
-    await ctx.send(f"✅ Đã thêm playlist `{name}` vào hàng đợi.")
+    await ctx.send(f"✅ Đã thêm playlist `{name}` vào hàng đợi")
 
 @tree.command(name="play_playlist", description="Phát playlist đã lưu theo tên")
 async def slash_play_playlist(interaction: discord.Interaction, name: str):
@@ -1206,7 +1205,7 @@ async def slash_play_playlist(interaction: discord.Interaction, name: str):
     player = get_player_for_ctx(interaction.guild, interaction.channel)
     for item in PLAYLISTS[name]:
         await player.add_track(item)
-    await interaction.response.send_message(f"✅ Đã thêm playlist `{name}` vào hàng đợi.", ephemeral=True)
+    await interaction.response.send_message(f"✅ Đã thêm playlist `{name}` vào hàng đợi", ephemeral=True)
 
 @bot.command(name="shutdown")
 @commands.check(lambda ctx: True if OWNER_ID is None else ctx.author.id == int(OWNER_ID))
@@ -1234,7 +1233,7 @@ async def text_shutdown(ctx):
 @tree.command(name="shutdown", description="Tắt bot")
 async def slash_shutdown(interaction: discord.Interaction):
     if OWNER_ID is not None and interaction.user.id != int(OWNER_ID):
-        await interaction.response.send_message("Chỉ owner mới có thể tắt bot.", ephemeral=True)
+        await interaction.response.send_message("Chỉ owner mới có thể tắt bot", ephemeral=True)
         return
     await interaction.response.send_message("⚠️ Đang tắt bot...")
     save_playlists()
@@ -1338,13 +1337,13 @@ async def slash_unloop(interaction: discord.Interaction):
 async def text_help(ctx):
     embed = discord.Embed(title="Monica Bot — Trợ giúp", color=0x5865F2, description="Các lệnh chính :")
     embed.add_field(name="/join  |  !join", value="Kêu bot vào kênh thoại của bạn", inline=False)
-    embed.add_field(name="/play <query>  |  !play <query>", value="Thêm bài vào hàng đợi (link hoặc tên).", inline=False)
+    embed.add_field(name="/play <query>  |  !play <query>", value="Thêm bài vào hàng đợi (link hoặc tên bài nhạc).", inline=False)
     embed.add_field(name="/pause / /resume / /skip / /stop", value="Dừng / tiếp tục / bỏ qua / dừng và xóa hàng đợi", inline=False)
     embed.add_field(name="/queue / /now / /volume", value="Xem hàng đợi (10 bài tiếp theo), hiển thị bài đang phát, đặt âm lượng", inline=False)
     embed.add_field(name="/clear_all", value="Xóa toàn bộ hàng đợi", inline=False)
     embed.add_field(name="/clear <tên>", value="Xóa các bài khớp với tên khỏi hàng đợi", inline=False)
     embed.add_field(name="/loop_all / /unloop", value="Bật/tắt vòng lặp cho toàn bộ hàng đợi hiện tại", inline=False)
-    embed.add_field(name="/list_playlists / /save_playlist / /play_playlist", value="Quản lý playlist đã lưu (save chỉ owner nếu cấu hình)", inline=False)
+    embed.add_field(name="/list_playlists / /save_playlist / /play_playlist", value="Quản lý playlist đã lưu (chưa ổn định lắm, mình không khuyến khích xài đâu 😭)", inline=False)
     embed.set_footer(text="Monica Music Bot v2.0 • By shio")
     await ctx.send(embed=embed)
 
@@ -1362,7 +1361,7 @@ async def slash_help(interaction: discord.Interaction):
 async def on_command_error(ctx, error):
     logger.exception("Command error: %s", error)
     try:
-        await ctx.send("Đã có lỗi xảy ra. Mình đã ghi lại log để admin kiểm tra.")
+        await ctx.send("Đã có lỗi xảy ra. Mình đã ghi lại log để shio kiểm tra.")
     except Exception:
         pass
 
@@ -1370,7 +1369,7 @@ async def on_command_error(ctx, error):
 async def on_app_command_error(interaction, error):
     logger.exception("App command error: %s", error)
     try:
-        await interaction.response.send_message("Đã có lỗi xảy ra. Mình đã ghi lại log để admin kiểm tra.", ephemeral=True)
+        await interaction.response.send_message("Đã có lỗi xảy ra. Mình đã ghi lại log để shio kiểm tra.", ephemeral=True)
     except Exception:
         pass
 
@@ -1379,7 +1378,7 @@ async def on_app_command_error(interaction, error):
 async def text_leave(ctx):
     vc = discord.utils.get(bot.voice_clients, guild=ctx.guild)
     if not vc or not vc.is_connected():
-        await ctx.send("Bot chưa kết nối kênh thoại nào")
+        await ctx.send("Mình chưa kết nối kênh thoại nào cả :<")
         return
     try:
         await vc.disconnect()
@@ -1387,13 +1386,13 @@ async def text_leave(ctx):
         p = players.pop(ctx.guild.id, None)
         if p:
             p.destroy()
-    await ctx.send("Mình đã rời kênh thoại, hẹn gặp lại :3")
+    await ctx.send("Mình đã rời kênh thoại rùi, hẹn gặp lại :3")
 
 @tree.command(name="leave", description="Bot rời kênh thoại")
 async def slash_leave(interaction: discord.Interaction):
     vc = discord.utils.get(bot.voice_clients, guild=interaction.guild)
     if not vc or not vc.is_connected():
-        await interaction.response.send_message("Bot chưa kết nối kênh thoại nào", ephemeral=True)
+        await interaction.response.send_message("Mình chưa kết nối kênh thoại nào cả :<", ephemeral=True)
         return
     try:
         await vc.disconnect()
@@ -1431,7 +1430,6 @@ async def slash_stop(interaction: discord.Interaction):
         player.destroy()
     await interaction.response.send_message("⏹️ Đã dừng phát và xóa hàng đợi", ephemeral=True)
 
-# graceful shutdown helper (to be called from main)
 def _graceful_shutdown_sync():
     logger.info("Signal received: saving playlists and closing")
     try:
@@ -1449,22 +1447,18 @@ def _graceful_shutdown_sync():
             json.dump(snap, f, ensure_ascii=False, indent=2)
     except Exception:
         logger.exception("Failed snapshot during shutdown")
-    # we cannot await here; rely on bot.close() in the main loop
 
 if __name__ == "__main__":
-    # ensure there is a running event loop for legacy uses (avoids DeprecationWarning)
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
-    # Register signal handlers in the running loop (best effort, may not be supported on some platforms)
     try:
         loop.add_signal_handler(signal.SIGINT, _graceful_shutdown_sync)
         loop.add_signal_handler(signal.SIGTERM, _graceful_shutdown_sync)
     except Exception:
-        # older Windows or other OS may not support add_signal_handler in this context - ignore
         pass
 
     if not TOKEN:
