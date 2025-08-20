@@ -3,14 +3,12 @@
 from __future__ import annotations
 
 import sys
-# Ensure stdout/stderr can print UTF-8 (prevents UnicodeEncodeError on Windows console)
 try:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
     if hasattr(sys.stderr, "reconfigure"):
         sys.stderr.reconfigure(encoding="utf-8")
 except Exception:
-    # best-effort; continue even if reconfigure not available
     pass
 
 import asyncio
@@ -1335,7 +1333,11 @@ async def slash_unloop(interaction: discord.Interaction):
 
 @bot.command(name="help")
 async def text_help(ctx):
-    embed = discord.Embed(title="Monica Bot — Trợ giúp", color=0x5865F2, description="Các lệnh chính :")
+    embed = discord.Embed(
+        title="Monica Bot — Trợ giúp", 
+        color=0x5865F2, 
+        description="Các lệnh chính :"
+    )
     embed.add_field(name="/join  |  !join", value="Kêu bot vào kênh thoại của bạn", inline=False)
     embed.add_field(name="/play <query>  |  !play <query>", value="Thêm bài vào hàng đợi (link hoặc tên bài nhạc).", inline=False)
     embed.add_field(name="/pause / /resume / /skip / /stop", value="Dừng / tiếp tục / bỏ qua / dừng và xóa hàng đợi", inline=False)
@@ -1343,18 +1345,43 @@ async def text_help(ctx):
     embed.add_field(name="/clear_all", value="Xóa toàn bộ hàng đợi", inline=False)
     embed.add_field(name="/clear <tên>", value="Xóa các bài khớp với tên khỏi hàng đợi", inline=False)
     embed.add_field(name="/loop_all / /unloop", value="Bật/tắt vòng lặp cho toàn bộ hàng đợi hiện tại", inline=False)
-    embed.add_field(name="/list_playlists / /save_playlist / /play_playlist", value="Quản lý playlist đã lưu (chưa ổn định lắm, mình không khuyến khích xài đâu 😭)", inline=False)
-    embed.set_footer(text="Monica Music Bot v2.0 • By shio")
+    embed.add_field(name="/list_playlists / /save_playlist / /play_playlist", value="Quản lý playlist đã lưu (chưa ổn định, không khuyến khích dùng 😭)", inline=False)
+
+    # Disclaimer
+    disclaimer_text = (
+        "⚠️ **Disclaimer**\n"
+        "Monica-Music-Bot is for personal and educational use only.\n"
+        "Using it with YouTube or copyrighted sources may violate their Terms of Service.\n"
+        "The author is not responsible for misuse of this software."
+    )
+    embed.add_field(name="Disclaimer", value=disclaimer_text, inline=False)
+
+    embed.set_footer(text="Monica Music Bot v2.1 • By shio")
     await ctx.send(embed=embed)
+
 
 @tree.command(name="help", description="Hiện help embed")
 async def slash_help(interaction: discord.Interaction):
-    embed = discord.Embed(title="Monica Bot — Help", color=0x5865F2, description="Các lệnh chính:") 
+    embed = discord.Embed(
+        title="Monica Bot — Help", 
+        color=0x5865F2, 
+        description="Các lệnh chính:"
+    )
     embed.add_field(name="/join  |  !join", value="Kêu bot vào kênh thoại của bạn", inline=False)
     embed.add_field(name="/play <query>  |  !play <query>", value="Thêm bài vào hàng đợi (link hoặc tên).", inline=False)
     embed.add_field(name="/pause / /resume / /skip / /stop", value="Dừng / tiếp tục / bỏ qua / dừng và xóa hàng đợi", inline=False)
     embed.add_field(name="/queue / /now / /volume", value="Xem hàng đợi (10 bài tiếp theo), hiển thị bài đang phát, đặt âm lượng", inline=False)
+
+    disclaimer_text = (
+        "⚠️ **Disclaimer**\n"
+        "Monica-Music-Bot is for personal and educational use only.\n"
+        "Using it with YouTube or copyrighted sources may violate their Terms of Service.\n"
+        "The author is not responsible for misuse of this software."
+    )
+    embed.add_field(name="Disclaimer", value=disclaimer_text, inline=False)
+
     await interaction.response.send_message(embed=embed)
+
 
 # error handlers
 @bot.event
