@@ -36,7 +36,6 @@ DEFAULT_CONFIG = {
     "owner_id": None,
     "max_queue_size": 200,
     "download_concurrency": 2,
-    "cache_ttl_seconds": 900,
     "cache_size_limit": 200,
     "ffmpeg_bitrate": "128k",
     "ffmpeg_threads": 1,
@@ -70,16 +69,16 @@ MAX_QUEUE_SIZE = int(CONFIG.get("max_queue_size", 200))
 DOWNLOAD_CONCURRENCY = max(1, int(CONFIG.get("download_concurrency", 1)))
 CACHE_TTL_SECONDS = int(CONFIG.get("cache_ttl_seconds", 900))
 CACHE_SIZE_LIMIT = int(CONFIG.get("cache_size_limit", 200))
-FFMPEG_BITRATE = str(CONFIG.get("ffmpeg_bitrate", "96k"))
+FFMPEG_BITRATE = str(CONFIG.get("ffmpeg_bitrate", "128k"))
 FFMPEG_THREADS = int(CONFIG.get("ffmpeg_threads", 1))
 PREFETCH_NEXT = bool(CONFIG.get("prefetch_next", False))
 IDLE_DISCONNECT_SECONDS = int(CONFIG.get("idle_disconnect_seconds", 300))
 # v2.7: streaming profile and now-playing update interval
 STREAM_PROFILE = str(CONFIG.get("stream_profile", "stable")).lower().strip() or "stable"
 NOW_UPDATE_INTERVAL = max(5, int(CONFIG.get("now_update_interval_seconds", 12)))
-# auto-disconnect when idle and no interactions (seconds) — v2.6: 180s, silent
-AUTO_DISCONNECT_SECONDS = 180
-VERSION = "v2.8.0"
+# auto-disconnect when idle and no interactions (seconds) — 300s, silent
+AUTO_DISCONNECT_SECONDS = 300
+VERSION = "v2.8.4"
 
 # v2.7.1: helpers to persist config and change runtime profile
 def _persist_config():
@@ -94,8 +93,10 @@ def set_stream_profile(profile: str) -> str:
     p = (profile or "").lower().strip()
     if p in ("low_latency", "low", "fast"):
         p = "low-latency"
-    if p not in ("stable", "low-latency"):
-        raise ValueError("Profile phải là 'stable' hoặc 'low-latency'")
+    if p in ("super", "ultra", "ultra-low", "ultra_low", "super_low_latency", "super-low", "sll", "ull"):
+        p = "super-low-latency"
+    if p not in ("stable", "low-latency", "super-low-latency"):
+        raise ValueError("Profile phải là 'stable', 'low-latency' hoặc 'super-low-latency'")
     STREAM_PROFILE = p
     try:
         CONFIG["stream_profile"] = p
@@ -179,8 +180,19 @@ YTDL_OPTS = {
     # do not force source_address here (can cause binding issues on some systems)
 }
 ytdl = YoutubeDL(YTDL_OPTS)
-# Base reconnect options shared by profiles; v2.7 adds eof reconnect
-FFMPEG_BEFORE_BASE = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -reconnect_at_eof 1 -rw_timeout 15000000 -nostdin -http_persistent 1 -seekable 1 -thread_queue_size 1024"
+# HTTP User-Agent used by ffmpeg for input requests
+HTTP_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
+)
+
+# Base reconnect options shared by profiles; include safe start-at-0 and headers
+FFMPEG_BEFORE_BASE = (
+    "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -reconnect_at_eof 1 "
+    "-rw_timeout 15000000 -nostdin -http_persistent 1 -seekable 1 -thread_queue_size 1024 "
+    "-ss 0 "
+    f"-headers \"User-Agent: {HTTP_UA}\\r\\n\""
+)
 
 # v2.8.0: bug report path
 BUG_REPORT_LOG_PATH = "report_bug.log"
@@ -197,8 +209,9 @@ def _sanitize_stream_url(u: Optional[str]) -> Optional[str]:
     try:
         pr = urlparse(u)
         q = parse_qsl(pr.query, keep_blank_values=True)
-        # Remove range-related hints; keep stable params
-        filtered = [(k, v) for (k, v) in q if k.lower() not in ("range", "rn", "rbuf")]
+        # Remove range- and offset-related hints; keep stable params
+        bad_keys = {"range", "rn", "rbuf", "start", "st", "begin", "sq", "dur", "t", "offset"}
+        filtered = [(k, v) for (k, v) in q if k.lower() not in bad_keys]
         new_q = urlencode(filtered)
         return urlunparse((pr.scheme, pr.netloc, pr.path, pr.params, new_q, pr.fragment))
     except Exception:
@@ -332,12 +345,22 @@ def _pick_best_audio_url(info: dict) -> Optional[str]:
             except Exception:
                 pass
         # prefer http/https protocols
-        proto = f.get("protocol") or ""
+        proto = (f.get("protocol") or "").lower()
         if proto.startswith("http"):
             s += 5
+        # strongly avoid HLS/m3u8 as they often carry timestamp offsets
+        if "m3u8" in proto or "hls" in proto:
+            s -= 100
         # prefer non-dash if possible
         if f.get("vcodec") in (None, "none"):
             s += 3
+        # avoid formats with non-zero start_time if present
+        try:
+            st = f.get("start_time")
+            if st and float(st) > 0.5:
+                s -= 50
+        except Exception:
+            pass
         return s
 
     best = max(candidates, key=score)
@@ -545,15 +568,30 @@ class YTDLTrack:
 # audio creation
 def _ffmpeg_options_for_profile(volume: float):
     vol = max(0.0, min(float(volume), 4.0))
-    if STREAM_PROFILE == "low-latency":
-     # Lower analyzeduration/probesize to start faster, keep reasonable buffers to reduce stutter
-     opts = f'-vn -af "volume={vol}" -b:a {FFMPEG_BITRATE} -ar 48000 -threads {FFMPEG_THREADS} ' \
-         f'-nostats -loglevel error -probesize 64k -analyzeduration 100000 -bufsize 512k -rtbufsize 512k'
-     before = FFMPEG_BEFORE_BASE
+    if STREAM_PROFILE == "super-low-latency":
+        # Extreme low-latency: tiniest probe/analyze, no input buffering. Requires strong CPU/network.
+        # Notes: may stutter on unstable links. Best when bot is close to Discord region.
+        before = FFMPEG_BEFORE_BASE
+        opts = (
+            f'-vn -af "volume={vol}" -b:a {FFMPEG_BITRATE} -ar 48000 -threads {FFMPEG_THREADS} '
+            f'-nostats -loglevel error -probesize 16k -analyzeduration 0 -bufsize 256k -rtbufsize 256k '
+            f'-fflags nobuffer -flags low_delay -max_delay 0 -reorder_queue_size 0 -flush_packets 1'
+        )
+    elif STREAM_PROFILE == "low-latency":
+        # Lower analyzeduration/probesize to start faster, keep reasonable buffers to reduce stutter
+        before = FFMPEG_BEFORE_BASE
+        opts = (
+            f'-vn -af "volume={vol}" -b:a {FFMPEG_BITRATE} -ar 48000 -threads {FFMPEG_THREADS} '
+            f'-nostats -loglevel error -probesize 64k -analyzeduration 100000 -bufsize 512k -rtbufsize 512k'
+        )
     else:  # stable
-     opts = f'-vn -af "volume={vol}" -b:a {FFMPEG_BITRATE} -ar 48000 -threads {FFMPEG_THREADS} ' \
-         f'-nostats -loglevel error -probesize 256k -analyzeduration 1000000 -bufsize 1M -rtbufsize 1M'
-     before = FFMPEG_BEFORE_BASE
+        # Stable: be conservative; normalize timestamps and throttle input with -re (on before_options) to avoid fast playback
+        before = FFMPEG_BEFORE_BASE + " -re"
+        opts = (
+            f'-vn -af "volume={vol}" -b:a {FFMPEG_BITRATE} -ar 48000 -threads {FFMPEG_THREADS} '
+            f'-fflags +genpts -avoid_negative_ts make_zero -muxpreload 0 -muxdelay 0 '
+            f'-nostats -loglevel error -probesize 512k -analyzeduration 1500000 -bufsize 1M -rtbufsize 1M'
+        )
     return before, opts
 
 
@@ -819,7 +857,7 @@ class MusicPlayer:
         embed.add_field(name="⏱️ Thời lượng", value=format_duration(data.get("duration")), inline=True)
         if data.get("requested_by"):
             embed.add_field(name="🙋 Yêu cầu", value=truncate(data.get("requested_by"), 30), inline=True)
-        embed.set_footer(text="Nếu gặp lỗi bạn hãy báo cáo qua /report để được hỗ trợ sửa lỗi nhanh chóng cho bạn nhé ✨")
+        embed.set_footer(text=f"Sẽ mất thêm vài giây để mình xử lý yêu cầu. Bạn chịu khó đợi thêm chút nha 💕")
         return embed
 
     async def _player_loop(self):
@@ -1245,11 +1283,28 @@ async def text_report(ctx):
 @tree.command(name="report", description="Gửi báo cáo lỗi bạn đang gặp phải")
 async def slash_report(interaction: discord.Interaction):
     try:
+        # If this interaction was already acknowledged (very rare), we cannot open a modal
+        if getattr(interaction.response, "is_done", lambda: False)():
+            try:
+                await interaction.followup.send("Phiên tương tác đã hết hạn, vui lòng dùng lại /report.", ephemeral=True)
+            except Exception:
+                pass
+            return
         await interaction.response.send_modal(ReportModal(interaction.user, interaction.guild))
+    except discord.NotFound as e:
+        # 10062 Unknown interaction — typically expired interaction token; don't spam error logs
+        logger.warning("Report modal failed: unknown interaction (likely expired): %s", e)
+        try:
+            await interaction.followup.send("Phiên tương tác đã hết hạn, vui lòng dùng lại /report.", ephemeral=True)
+        except Exception:
+            pass
     except Exception:
         logger.exception("Failed to open report modal")
         try:
-            await interaction.followup.send("Không thể mở form báo cáo ngay lúc này.", ephemeral=True)
+            if getattr(interaction.response, "is_done", lambda: False)():
+                await interaction.followup.send("Không thể mở form báo cáo ngay lúc này.", ephemeral=True)
+            else:
+                await interaction.response.send_message("Không thể mở form báo cáo ngay lúc này.", ephemeral=True)
         except Exception:
             pass
 
@@ -1346,16 +1401,43 @@ async def handle_play_request(ctx_or_interaction, query: str):
 
     ch = user.voice.channel
     vc = discord.utils.get(bot.voice_clients, guild=guild)
+    # Quick ack: let user know we're searching/processing for stability
+    ack_msg = None
+    try:
+        ack_embed = discord.Embed(
+            title="Monica đang tìm kiếm... 🔎",
+            description=f"{truncate(query, 100)}\nBạn hãy đợi vài giây để mình tìm kiếm nhạc cho bạn nhé 💕",
+            color=THEME_COLOR,
+        )
+        ack_embed.set_footer(text=f"Monica {VERSION} • By shio")
+        if isinstance(ctx_or_interaction, discord.Interaction):
+            # For deferred interactions, use followup
+            try:
+                ack_msg = await ctx_or_interaction.followup.send(embed=ack_embed)
+            except Exception:
+                # Fallback to edit original response if needed
+                try:
+                    await ctx_or_interaction.edit_original_response(embed=ack_embed)
+                except Exception:
+                    pass
+        else:
+            ack_msg = await ctx_or_interaction.send(embed=ack_embed)
+    except Exception:
+        pass
+
     if not vc or not vc.is_connected():
         try:
             vc = await ch.connect()
         except Exception:
             logger.exception("Connect failed")
             try:
-                if isinstance(ctx_or_interaction, discord.Interaction):
-                    await ctx_or_interaction.response.send_message("Không thể kết nối vào kênh thoại", ephemeral=True)
+                if ack_msg is not None:
+                    await ack_msg.edit(content=None, embed=discord.Embed(title="❌ Không thể kết nối kênh thoại", color=ERR_COLOR))
                 else:
-                    await ctx_or_interaction.send("Không thể kết nối kênh thoại.")
+                    if isinstance(ctx_or_interaction, discord.Interaction):
+                        await ctx_or_interaction.response.send_message("Không thể kết nối vào kênh thoại", ephemeral=True)
+                    else:
+                        await ctx_or_interaction.send("Không thể kết nối kênh thoại.")
             except Exception:
                 pass
             return
@@ -1377,10 +1459,14 @@ async def handle_play_request(ctx_or_interaction, query: str):
     except Exception as e:
         logger.exception("Resolve failed: %s", e)
         try:
-            if isinstance(ctx_or_interaction, discord.Interaction):
-                await ctx_or_interaction.response.send_message(f"Lỗi khi tìm kiếm: {e}", ephemeral=True)
+            err_embed = discord.Embed(title="❌ Lỗi khi tìm kiếm", description=str(e), color=ERR_COLOR)
+            if ack_msg is not None:
+                await ack_msg.edit(content=None, embed=err_embed)
             else:
-                await ctx_or_interaction.send(f"Lỗi khi tìm kiếm: {e}")
+                if isinstance(ctx_or_interaction, discord.Interaction):
+                    await ctx_or_interaction.response.send_message(f"Lỗi khi tìm kiếm: {e}", ephemeral=True)
+                else:
+                    await ctx_or_interaction.send(f"Lỗi khi tìm kiếm: {e}")
         except Exception:
             pass
         return
@@ -1392,10 +1478,13 @@ async def handle_play_request(ctx_or_interaction, query: str):
     except Exception as e:
         logger.exception("Add track failed: %s", e)
         try:
-            if isinstance(ctx_or_interaction, discord.Interaction):
-                await ctx_or_interaction.response.send_message(str(e), ephemeral=True)
+            if ack_msg is not None:
+                await ack_msg.edit(content=None, embed=discord.Embed(title="❌ Không thể thêm vào hàng đợi", description=str(e), color=ERR_COLOR))
             else:
-                await ctx_or_interaction.send(str(e))
+                if isinstance(ctx_or_interaction, discord.Interaction):
+                    await ctx_or_interaction.response.send_message(str(e), ephemeral=True)
+                else:
+                    await ctx_or_interaction.send(str(e))
         except Exception:
             pass
         return
@@ -1415,30 +1504,34 @@ async def handle_play_request(ctx_or_interaction, query: str):
             embed.add_field(name="👤 Nghệ sĩ", value=truncate(track.data.get("uploader"), 64), inline=True)
         if track.data.get("duration"):
             embed.add_field(name="⏱️ Thời lượng", value=format_duration(track.data.get("duration")), inline=True)
-        embed.set_footer(text="Nếu gặp lỗi bạn hãy báo cáo qua /report để được hỗ trợ sửa lỗi nhanh chóng cho bạn nhé ✨")
-        if isinstance(ctx_or_interaction, discord.Interaction):
-            # If the slash command was previously deferred, use followup to send the
-            # message. Using response.send_message after a defer will fail and can
-            # leave the client stuck on the "thinking" indicator. Try sensible
-            # fallbacks to maximize compatibility.
+        embed.set_footer(text="Nếu gặp bạn gặp phải lỗi gì thì dùng /report để được hỗ trợ sửa lỗi nhanh chóng nhé ✨")
+        if ack_msg is not None:
             try:
-                # Prefer followup (works after defer)
-                await ctx_or_interaction.followup.send(embed=embed)
+                await ack_msg.edit(embed=embed)
             except Exception:
+                # fallback to sending
                 try:
-                    # If followup isn't available or fails, try editing the original
-                    # response (works if a deferred response exists).
-                    await ctx_or_interaction.edit_original_response(embed=embed)
+                    if isinstance(ctx_or_interaction, discord.Interaction):
+                        await ctx_or_interaction.followup.send(embed=embed)
+                    else:
+                        await ctx_or_interaction.send(embed=embed)
+                except Exception:
+                    pass
+        else:
+            if isinstance(ctx_or_interaction, discord.Interaction):
+                # Prefer followup (works after defer)
+                try:
+                    await ctx_or_interaction.followup.send(embed=embed)
                 except Exception:
                     try:
-                        # Last resort: attempt to use response.send_message (for
-                        # non-deferred flows) to avoid silent failures.
-                        await ctx_or_interaction.response.send_message(embed=embed)
+                        await ctx_or_interaction.edit_original_response(embed=embed)
                     except Exception:
-                        # Give up silently; errors were logged upstream where appropriate.
-                        pass
-        else:
-            await ctx_or_interaction.send(embed=embed)
+                        try:
+                            await ctx_or_interaction.response.send_message(embed=embed)
+                        except Exception:
+                            pass
+            else:
+                await ctx_or_interaction.send(embed=embed)
     except Exception:
         pass
 
@@ -1580,15 +1673,15 @@ async def slash_now(interaction: discord.Interaction):
 async def text_profile(ctx, profile: Optional[str] = None):
     try:
         if not profile:
-            await ctx.send(f"Profile hiện tại: {STREAM_PROFILE} (stable|low-latency)")
+            await ctx.send(f"Profile hiện tại: {STREAM_PROFILE} (stable | low-latency | super-low-latency)")
             return
         newp = set_stream_profile(profile)
         await ctx.send(f"✅ Đã đặt profile: {newp}")
     except Exception as e:
         await ctx.send(f"❌ {e}")
 
-@tree.command(name="profile", description="Xem/đặt profile streaming (stable | low-latency)")
-@discord.app_commands.describe(mode="stable | low-latency (để trống để xem hiện tại)")
+@tree.command(name="profile", description="Xem/đặt profile streaming (stable | low-latency | super-low-latency)")
+@discord.app_commands.describe(mode="stable | low-latency | super-low-latency (để trống để xem hiện tại)")
 async def slash_profile(interaction: discord.Interaction, mode: Optional[str] = None):
     try:
         if not mode:
@@ -1848,7 +1941,6 @@ async def text_help(ctx):
     embed.add_field(name="/clear <tên> / /clear_all", value="Xóa mục theo tên (một phần) / xóa toàn bộ hàng đợi", inline=False)
     embed.add_field(name="/queue / /now / /volume", value="Xem hàng đợi (10 bài tiếp theo), hiển thị bài đang phát, đặt âm lượng", inline=False)
     embed.add_field(name="/reverse / /loop_all / /unloop", value="Quay lại bài vừa phát / bật loop cho hàng đợi / tắt loop", inline=False)
-    embed.add_field(name="/profile / /stats / /version", value="Đặt profile phát (stable/low-latency) / xem trạng thái / phiên bản", inline=False)
     embed.add_field(name="/report  |  !report", value="Mở form để gửi báo cáo lỗi (Tên lỗi, chức năng, mô tả)", inline=False)
     embed.add_field(name="Nút điều khiển", value="⏯️ Tạm dừng/Tiếp tục • ⏭️ Bỏ qua • ⏹️ Dừng phát • 📜 Hàng đợi • 🔁 Loop • ↩️ Quay lại", inline=False)
 
@@ -1857,7 +1949,7 @@ async def text_help(ctx):
         "Tác giả từ chối mọi trách nhiệm phát sinh từ việc sử dụng hoặc lạm dụng phần mềm này."
     )
     embed.add_field(name="Disclaimer", value=disclaimer_text, inline=False)
-    embed.set_footer(text="Monica Music Bot v2.8.0 • By shio")
+    embed.set_footer(text="Monica Music Bot v2.8.4 • By shio")
     await ctx.send(embed=embed)
 
 
@@ -1874,7 +1966,6 @@ async def slash_help(interaction: discord.Interaction):
     embed.add_field(name="/clear <tên> / /clear_all", value="Xóa mục theo tên (một phần) / xóa toàn bộ hàng đợi", inline=False)
     embed.add_field(name="/queue / /now / /volume", value="Xem hàng đợi (10 bài tiếp theo), hiển thị bài đang phát, đặt âm lượng", inline=False)
     embed.add_field(name="/reverse / /loop_all / /unloop", value="Quay lại bài vừa phát / bật loop cho hàng đợi / tắt loop", inline=False)
-    embed.add_field(name="/profile / /stats / /version", value="Đặt profile phát (stable/low-latency) / xem trạng thái / phiên bản", inline=False)
     embed.add_field(name="/report  |  !report", value="Mở form để gửi báo cáo lỗi (Tên lỗi, chức năng, mô tả)", inline=False)
     embed.add_field(name="Nút điều khiển", value="⏯️ Tạm dừng/Tiếp tục • ⏭️ Bỏ qua • ⏹️ Dừng phát • 📜 Hàng đợi • 🔁 Loop • ↩️ Quay lại", inline=False)
 
@@ -1883,7 +1974,7 @@ async def slash_help(interaction: discord.Interaction):
         "Tác giả từ chối mọi trách nhiệm phát sinh từ việc sử dụng hoặc lạm dụng phần mềm này."
     )
     embed.add_field(name="Disclaimer", value=disclaimer_text, inline=False)
-    embed.set_footer(text="Monica Music Bot v2.8.0 • By shio")
+    embed.set_footer(text="Monica Music Bot v2.8.4 • By shio")
 
     await interaction.response.send_message(embed=embed)
 
