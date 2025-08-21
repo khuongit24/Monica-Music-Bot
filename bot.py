@@ -44,7 +44,7 @@ DEFAULT_CONFIG = {
     "stream_profile": "stable",
     # v2.7: how often to update the now-playing progress (seconds)
     "now_update_interval_seconds": 12,
-    "idle_disconnect_seconds": 300,
+    "idle_disconnect_seconds": 900,
 }
 
 if os.path.exists(CONFIG_PATH):
@@ -72,13 +72,12 @@ CACHE_SIZE_LIMIT = int(CONFIG.get("cache_size_limit", 200))
 FFMPEG_BITRATE = str(CONFIG.get("ffmpeg_bitrate", "128k"))
 FFMPEG_THREADS = int(CONFIG.get("ffmpeg_threads", 1))
 PREFETCH_NEXT = bool(CONFIG.get("prefetch_next", False))
-IDLE_DISCONNECT_SECONDS = int(CONFIG.get("idle_disconnect_seconds", 300))
+IDLE_DISCONNECT_SECONDS = int(CONFIG.get("idle_disconnect_seconds", 900))
 # v2.7: streaming profile and now-playing update interval
 STREAM_PROFILE = str(CONFIG.get("stream_profile", "stable")).lower().strip() or "stable"
 NOW_UPDATE_INTERVAL = max(5, int(CONFIG.get("now_update_interval_seconds", 12)))
-# auto-disconnect when idle and no interactions (seconds) — 300s, silent
-AUTO_DISCONNECT_SECONDS = 300
-VERSION = "v2.8.4"
+# auto-disconnect when idle and no interactions uses IDLE_DISCONNECT_SECONDS
+VERSION = "v2.9.3"
 
 # v2.7.1: helpers to persist config and change runtime profile
 def _persist_config():
@@ -614,11 +613,15 @@ class MusicPlayer:
         self.text_channel = text_channel
         self.queue = AsyncDequeQueue()
         self.next_event = asyncio.Event()
-        self.current: Optional[dict] = None
-        self.volume: float = 1.0
-        self.loop_mode: bool = False
-        self.loop_list: List[dict] = []
+        self.current = None
+        self.volume = 1.0
+        # loop_all: requeue current and full queue snapshot; loop_one: repeat only current track
+        self.loop_mode = False  # legacy flag for loop_all
+        self.loop_one = False   # new single-track loop flag
+        self.loop_list = []
         self.history = deque(maxlen=200)
+        # internal: when skipping while loop-one is active, suppress requeue of the skipped track once
+        self._suppress_loop_requeue_once = False
         # capture the loop running when player is created
         # Prefer the bot's running loop if available; otherwise use current running loop.
         try:
@@ -646,20 +649,14 @@ class MusicPlayer:
         self.now_update_task = None
         # last interaction / activity timestamp for idle disconnect
         self._last_active = time.time()
-        self.idle_task = None
-        # whether we've warned the channel about imminent disconnect
+        # whether we've warned the channel about imminent disconnect (kept for potential future use)
         self._idle_warned = False
         if PREFETCH_NEXT:
             try:
                 self.prefetch_task = asyncio.create_task(self._prefetch_worker())
             except Exception:
                 self.prefetch_task = None
-        # start idle watchdog
-        try:
-            if AUTO_DISCONNECT_SECONDS and AUTO_DISCONNECT_SECONDS > 0:
-                self.idle_task = asyncio.create_task(self._idle_watchdog())
-        except Exception:
-            self.idle_task = None
+        # idle watchdog removed in v2.9.3; rely on queue timeout inside player loop
     @staticmethod
     def _tracks_equal(a: Any, b: Any) -> bool:
         try:
@@ -744,14 +741,30 @@ class MusicPlayer:
             snapshot.extend(self.queue.snapshot())
             self.loop_list = [dict(item) for item in snapshot]
             self.loop_mode = True
+            self.loop_one = False
             logger.info("Loop mode enabled for guild=%s count=%s", self.guild.id, len(self.loop_list))
             return len(self.loop_list)
 
     async def disable_loop(self):
         async with self._lock:
             self.loop_mode = False
+            self.loop_one = False
             self.loop_list = []
             logger.info("Loop mode disabled for guild=%s", self.guild.id)
+
+    async def enable_loop_one(self):
+        """Enable single-track loop for the currently playing item only."""
+        async with self._lock:
+            self.loop_one = True
+            # disable loop_all to avoid conflicts
+            self.loop_mode = False
+            self.loop_list = []
+            logger.info("Loop-one enabled for guild=%s", self.guild.id)
+
+    async def disable_loop_one(self):
+        async with self._lock:
+            self.loop_one = False
+            logger.info("Loop-one disabled for guild=%s", self.guild.id)
 
     async def _prefetch_worker(self):
         try:
@@ -784,36 +797,7 @@ class MusicPlayer:
         except Exception:
             logger.exception("Prefetch worker crashed")
 
-    async def _idle_watchdog(self):
-        try:
-            while True:
-                await asyncio.sleep(5)
-                try:
-                    vc = self.vc or discord.utils.get(self.bot.voice_clients, guild=self.guild)
-                    # if playing or queue not empty, refresh last_active
-                    if vc and vc.is_playing():
-                        self._last_active = time.time()
-                        self._idle_warned = False
-                        continue
-                    if not self.queue.empty():
-                        self._last_active = time.time()
-                        self._idle_warned = False
-                        continue
-
-                    # silent auto-disconnect when idle (v2.6)
-                    if time.time() - self._last_active >= AUTO_DISCONNECT_SECONDS:
-                        try:
-                            if vc and vc.is_connected():
-                                await vc.disconnect()
-                            players.pop(self.guild.id, None)
-                            self.destroy()
-                        except Exception:
-                            logger.exception("Idle watchdog failed to disconnect")
-                        return
-                except Exception:
-                    logger.exception("Idle watchdog loop error")
-        except asyncio.CancelledError:
-            return
+    # _idle_watchdog removed in v2.9.3
 
     async def _start_now_update(self, started_at: float, duration: Optional[float]):
         async def updater():
@@ -868,10 +852,14 @@ class MusicPlayer:
                 try:
                     item = await self.queue.get(timeout=IDLE_DISCONNECT_SECONDS)
                 except asyncio.TimeoutError:
-                    # v2.6: silent when timing out waiting for next item; disconnect politely
+                    # v2.9.3: notify and disconnect when idle with empty queue
                     try:
                         vc = self.vc or discord.utils.get(self.bot.voice_clients, guild=self.guild)
                         if vc and vc.is_connected():
+                            try:
+                                await self.text_channel.send("Không ai phát nhạc nên mình đi đây. Hẹn gặp lại ✨")
+                            except Exception:
+                                pass
                             await vc.disconnect()
                         logger.info("Idle queue timeout; disconnected voice (guild=%s)", self.guild.id)
                     except Exception:
@@ -1024,9 +1012,19 @@ class MusicPlayer:
                     pass
 
                 try:
-                    if self.loop_mode and isinstance(track, YTDLTrack) and track.data:
+                    # loop_one: repeat only current track immediately; if a skip just happened, suppress once
+                    if self.loop_one and isinstance(track, YTDLTrack) and track.data:
+                        if self._suppress_loop_requeue_once:
+                            logger.info("Loop-one: suppressed requeue after skip (guild=%s)", self.guild.id)
+                        else:
+                            await self.queue.put_front(track.data)
+                            logger.info("Loop-one repeat guild=%s title=%s", self.guild.id, truncate(track.data.get("title"), 80))
+                        # reset suppression flag after handling
+                        self._suppress_loop_requeue_once = False
+                    # loop_all: legacy simple behavior — requeue current track at end
+                    elif self.loop_mode and isinstance(track, YTDLTrack) and track.data:
                         await self.queue.put(track.data)
-                        logger.info("Loop requeue guild=%s title=%s", self.guild.id, truncate(track.data.get("title"), 80))
+                        logger.info("Loop-all requeue guild=%s title=%s", self.guild.id, truncate(track.data.get("title"), 80))
                 except Exception:
                     logger.exception("Failed to requeue for loop mode")
 
@@ -1160,7 +1158,20 @@ class MusicControls(ui.View):
         vc = discord.utils.get(bot.voice_clients, guild=inter.guild)
         if not vc or not vc.is_playing():
             await inter.response.send_message("Không có bài nhạc nào để bỏ qua", ephemeral=True); return
-        vc.stop(); await inter.response.send_message("⏭️ Đã bỏ qua bài nhạc", ephemeral=True)
+        player = players.get(inter.guild.id)
+        if not player:
+            vc.stop(); await inter.response.send_message("⏭️ Đã bỏ qua bài nhạc", ephemeral=True); return
+        # If queue is empty, do not stop current; notify user
+        if player.queue.empty():
+            await inter.response.send_message("Không có bài nhạc nào kế tiếp để mình chuyển qua, bạn thêm bài hát mới vào nhé 😋", ephemeral=True)
+            return
+        # There is next track; if loop_one is enabled, keep it for next track as well
+        keep_loop_one = bool(player.loop_one)
+        # If loop-one is active, suppress the immediate requeue of the just-stopped track
+        if keep_loop_one:
+            player._suppress_loop_requeue_once = True
+        vc.stop()
+        await inter.response.send_message("⏭️ Đã bỏ qua bài nhạc", ephemeral=True)
 
     @ui.button(emoji="⏹️", label="Dừng phát", style=discord.ButtonStyle.danger, row=0)
     async def stop(self, inter: discord.Interaction, button: ui.Button):
@@ -1211,13 +1222,7 @@ class MusicControls(ui.View):
         embed = discord.Embed(title="Queue (next up)", description=text or "Trống", color=0x2F3136)
         await inter.response.send_message(embed=embed, ephemeral=True)
 
-    @ui.button(emoji="🔁", label="Loop", style=discord.ButtonStyle.primary, row=1)
-    async def toggle_loop(self, inter: discord.Interaction, button: ui.Button):
-        player = players.get(inter.guild.id)
-        if not player:
-            await inter.response.send_message("Không có phiên phát nào đang chạy", ephemeral=True); return
-        player.loop_mode = not player.loop_mode
-        await inter.response.send_message(f"🔁 Loop {'Bật' if player.loop_mode else 'Tắt'}", ephemeral=True)
+    # Loop buttons removed in v2.9.2. Use /loop, /loop_all, /unloop commands instead.
 
     @ui.button(emoji="↩️", label="Quay lại", style=discord.ButtonStyle.secondary, row=1)
     async def reverse(self, inter: discord.Interaction, button: ui.Button):
@@ -1547,6 +1552,11 @@ async def text_join(ctx):
     player = players.get(ctx.guild.id)
     if player:
         try:
+            await player.disable_loop()
+            await player.disable_loop_one()
+        except Exception:
+            pass
+        try:
             await player.clear_all()
         except Exception:
             pass
@@ -1603,14 +1613,34 @@ async def text_skip(ctx):
     vc = discord.utils.get(bot.voice_clients, guild=ctx.guild)
     if not vc or not vc.is_playing():
         await ctx.send("Không có bài nhạc nào đang phát để bỏ qua"); return
-    vc.stop(); await ctx.send("⏭️ Đã skip bài hiện tại")
+    player = players.get(ctx.guild.id)
+    if not player:
+        vc.stop(); await ctx.send("⏭️ Đã skip bài hiện tại"); return
+    if player.queue.empty():
+        await ctx.send("Không có bài nhạc nào kế tiếp để mình chuyển qua, bạn thêm bài hát mới vào nhé 😋")
+        return
+    keep_loop_one = bool(player.loop_one)
+    if keep_loop_one:
+        player._suppress_loop_requeue_once = True
+    vc.stop()
+    await ctx.send("⏭️ Đã skip bài hiện tại")
 
 @tree.command(name="skip", description="Bỏ qua bài đang phát")
 async def slash_skip(interaction: discord.Interaction):
     vc = discord.utils.get(bot.voice_clients, guild=interaction.guild)
     if not vc or not vc.is_playing():
         await interaction.response.send_message("Không có nhạc đang phát để bỏ qua", ephemeral=True); return
-    vc.stop(); await interaction.response.send_message("⏭️ Đã skip bài hiện tại", ephemeral=True)
+    player = players.get(interaction.guild.id)
+    if not player:
+        vc.stop(); await interaction.response.send_message("⏭️ Đã skip bài hiện tại", ephemeral=True); return
+    if player.queue.empty():
+        await interaction.response.send_message("Không có bài nhạc nào kế tiếp để mình chuyển qua, bạn thêm bài hát mới vào nhé 😋", ephemeral=True)
+        return
+    keep_loop_one = bool(player.loop_one)
+    if keep_loop_one:
+        player._suppress_loop_requeue_once = True
+    vc.stop()
+    await interaction.response.send_message("⏭️ Đã skip bài hiện tại", ephemeral=True)
 
 @bot.command(name="queue")
 async def text_queue(ctx):
@@ -1707,7 +1737,8 @@ def _format_stats(guild: Optional[discord.Guild] = None) -> str:
     if p:
         lines.extend([
             f"Queue size: {p.queue.qsize()}",
-            f"Loop mode: {p.loop_mode}",
+            f"Loop mode (all): {p.loop_mode}",
+            f"Loop one: {p.loop_one}",
             f"Current: {truncate((p.current or {}).get('title'), 60) if p.current else 'None'}",
         ])
     return "\n".join(lines)
@@ -1841,7 +1872,7 @@ async def text_clear_all(ctx):
         await ctx.send("Không có hàng đợi nào để xóa")
         return
     count = await player.clear_all()
-    await ctx.send(f"🗑️ Đã xóa {count} bài trong hàng đợi.")
+    await ctx.send(f"🗑️ Đã xóa {count} bài trong hàng đợi")
 
 @tree.command(name="clear_all", description="Xóa toàn bộ hàng đợi")
 async def slash_clear_all(interaction: discord.Interaction):
@@ -1882,17 +1913,55 @@ async def text_loop_all(ctx):
     if not player or (not player.queue.snapshot() and not player.current):
         await ctx.send("Không có hàng đợi hoặc bài đang phát để vòng lặp.")
         return
+    # switching to loop_all cancels loop_one to avoid conflicts
+    try:
+        await player.disable_loop_one()
+    except Exception:
+        pass
     count = await player.enable_loop()
     await ctx.send(f"🔁 Bật loop cho {count} bài (queue hiện tại).")
 
-@tree.command(name="loop_all", description="Bật vòng lặp cho toàn bộ hàng đợi hiện tại")
+@tree.command(name="loop_all", description="Bật loop cho toàn bộ hàng đợi hiện tại")
 async def slash_loop_all(interaction: discord.Interaction):
     player = players.get(interaction.guild.id)
     if not player or (not player.queue.snapshot() and not player.current):
-        await interaction.response.send_message("Không có hàng đợi hoặc bài đang phát để vòng lặp.", ephemeral=True)
+        await interaction.response.send_message("Không có hàng đợi hoặc bài đang phát để loop", ephemeral=True)
         return
+    try:
+        await player.disable_loop_one()
+    except Exception:
+        pass
     count = await player.enable_loop()
     await interaction.response.send_message(f"🔁 Bật loop cho {count} bài (queue hiện tại).")
+
+
+@bot.command(name="loop")
+async def text_loop(ctx):
+    player = players.get(ctx.guild.id)
+    if not player or not player.current:
+        await ctx.send("Không có bài nào đang phát để bật loop bài hiện tại")
+        return
+    # Toggle behavior: if loop_one is on, turn it off; otherwise turn it on and turn off loop_all
+    if player.loop_one:
+        await player.disable_loop_one()
+        await ctx.send("⛔ Đã tắt loop đơn")
+    else:
+        await player.enable_loop_one()
+        await ctx.send("🔂 Đã bật loop bài hiện tại")
+
+
+@tree.command(name="loop", description="Bật/tắt loop bài hiện tại")
+async def slash_loop(interaction: discord.Interaction):
+    player = players.get(interaction.guild.id)
+    if not player or not player.current:
+        await interaction.response.send_message("Không có bài nào đang phát để bật loop bài hiện tại.", ephemeral=True)
+        return
+    if player.loop_one:
+        await player.disable_loop_one()
+        await interaction.response.send_message("⛔ Đã tắt loop đơn", ephemeral=True)
+    else:
+        await player.enable_loop_one()
+        await interaction.response.send_message("🔂 Đã bật loop bài hiện tại", ephemeral=True)
 
 @bot.command(name="unloop")
 async def text_unloop(ctx):
@@ -1905,23 +1974,11 @@ async def text_unloop(ctx):
 
 @tree.command(name="unloop", description="Tắt chế độ loop")
 async def slash_unloop(interaction: discord.Interaction):
-    vc = discord.utils.get(bot.voice_clients, guild=interaction.guild)
-    if vc:
-        try:
-            vc.stop()
-        except Exception:
-            pass
     player = players.get(interaction.guild.id)
     if player:
         try:
-            await player.clear_all()
-        except Exception:
-            pass
-        try:
-            player.current = None
-            if player.now_update_task and not player.now_update_task.done():
-                player.now_update_task.cancel()
-            player.now_message = None
+            await player.disable_loop()
+            await player.disable_loop_one()
         except Exception:
             pass
     await interaction.response.send_message("⛔ Đã tắt loop.", ephemeral=True)
@@ -1940,16 +1997,16 @@ async def text_help(ctx):
     embed.add_field(name="/pause / /resume / /skip / /stop / /leave", value="Dừng / tiếp tục / bỏ qua / dừng và xóa hàng đợi / rời kênh", inline=False)
     embed.add_field(name="/clear <tên> / /clear_all", value="Xóa mục theo tên (một phần) / xóa toàn bộ hàng đợi", inline=False)
     embed.add_field(name="/queue / /now / /volume", value="Xem hàng đợi (10 bài tiếp theo), hiển thị bài đang phát, đặt âm lượng", inline=False)
-    embed.add_field(name="/reverse / /loop_all / /unloop", value="Quay lại bài vừa phát / bật loop cho hàng đợi / tắt loop", inline=False)
+    embed.add_field(name="/reverse / /loop / /loop_all / /unloop", value="Quay lại bài vừa phát / bật loop 1 bài / bật loop cho hàng đợi / tắt loop", inline=False)
     embed.add_field(name="/report  |  !report", value="Mở form để gửi báo cáo lỗi (Tên lỗi, chức năng, mô tả)", inline=False)
-    embed.add_field(name="Nút điều khiển", value="⏯️ Tạm dừng/Tiếp tục • ⏭️ Bỏ qua • ⏹️ Dừng phát • 📜 Hàng đợi • 🔁 Loop • ↩️ Quay lại", inline=False)
+    embed.add_field(name="Nút điều khiển", value="⏯️ Tạm dừng/Tiếp tục • ⏭️ Bỏ qua • ⏹️ Dừng phát • 📜 Hàng đợi • ↩️ Quay lại", inline=False)
 
     disclaimer_text = (
         "Monica Music Bot chỉ được phép sử dụng cho mục đích cá nhân và không thương mại.\n"
         "Tác giả từ chối mọi trách nhiệm phát sinh từ việc sử dụng hoặc lạm dụng phần mềm này."
     )
     embed.add_field(name="Disclaimer", value=disclaimer_text, inline=False)
-    embed.set_footer(text="Monica Music Bot v2.8.4 • By shio")
+    embed.set_footer(text=f"Monica Music Bot {VERSION} • By shio")
     await ctx.send(embed=embed)
 
 
@@ -1965,16 +2022,16 @@ async def slash_help(interaction: discord.Interaction):
     embed.add_field(name="/pause / /resume / /skip / /stop / /leave", value="Dừng / tiếp tục / bỏ qua / dừng và xóa hàng đợi / rời kênh", inline=False)
     embed.add_field(name="/clear <tên> / /clear_all", value="Xóa mục theo tên (một phần) / xóa toàn bộ hàng đợi", inline=False)
     embed.add_field(name="/queue / /now / /volume", value="Xem hàng đợi (10 bài tiếp theo), hiển thị bài đang phát, đặt âm lượng", inline=False)
-    embed.add_field(name="/reverse / /loop_all / /unloop", value="Quay lại bài vừa phát / bật loop cho hàng đợi / tắt loop", inline=False)
+    embed.add_field(name="/reverse / /loop / /loop_all / /unloop", value="Quay lại bài vừa phát / bật loop 1 bài / bật loop cho hàng đợi / tắt loop", inline=False)
     embed.add_field(name="/report  |  !report", value="Mở form để gửi báo cáo lỗi (Tên lỗi, chức năng, mô tả)", inline=False)
-    embed.add_field(name="Nút điều khiển", value="⏯️ Tạm dừng/Tiếp tục • ⏭️ Bỏ qua • ⏹️ Dừng phát • 📜 Hàng đợi • 🔁 Loop • ↩️ Quay lại", inline=False)
+    embed.add_field(name="Nút điều khiển", value="⏯️ Tạm dừng/Tiếp tục • ⏭️ Bỏ qua • ⏹️ Dừng phát • 📜 Hàng đợi • ↩️ Quay lại", inline=False)
 
     disclaimer_text = (
         "Monica Music Bot chỉ được phép sử dụng cho mục đích cá nhân và không thương mại.\n"
         "Tác giả từ chối mọi trách nhiệm phát sinh từ việc sử dụng hoặc lạm dụng phần mềm này."
     )
     embed.add_field(name="Disclaimer", value=disclaimer_text, inline=False)
-    embed.set_footer(text="Monica Music Bot v2.8.4 • By shio")
+    embed.set_footer(text=f"Monica Music Bot {VERSION} • By shio")
 
     await interaction.response.send_message(embed=embed)
 
@@ -2038,6 +2095,7 @@ async def text_stop(ctx):
         try:
             # v2.7: stop disables loop to avoid requeue
             await player.disable_loop()
+            await player.disable_loop_one()
         except Exception:
             pass
         try:
@@ -2066,6 +2124,7 @@ async def slash_stop(interaction: discord.Interaction):
         try:
             # v2.7: stop disables loop to avoid requeue
             await player.disable_loop()
+            await player.disable_loop_one()
         except Exception:
             pass
         try:
