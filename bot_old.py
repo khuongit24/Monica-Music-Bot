@@ -18,6 +18,7 @@ import logging
 import time
 import signal
 from collections import deque, OrderedDict
+from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 from logging.handlers import RotatingFileHandler
 from typing import Dict, Optional, Any, List
 
@@ -69,7 +70,7 @@ MAX_QUEUE_SIZE = int(CONFIG.get("max_queue_size", 200))
 DOWNLOAD_CONCURRENCY = max(1, int(CONFIG.get("download_concurrency", 1)))
 CACHE_TTL_SECONDS = int(CONFIG.get("cache_ttl_seconds", 900))
 CACHE_SIZE_LIMIT = int(CONFIG.get("cache_size_limit", 200))
-FFMPEG_BITRATE = str(CONFIG.get("ffmpeg_bitrate", "96k"))
+FFMPEG_BITRATE = str(CONFIG.get("ffmpeg_bitrate", "128k"))
 FFMPEG_THREADS = int(CONFIG.get("ffmpeg_threads", 1))
 PREFETCH_NEXT = bool(CONFIG.get("prefetch_next", False))
 IDLE_DISCONNECT_SECONDS = int(CONFIG.get("idle_disconnect_seconds", 300))
@@ -78,7 +79,7 @@ STREAM_PROFILE = str(CONFIG.get("stream_profile", "stable")).lower().strip() or 
 NOW_UPDATE_INTERVAL = max(5, int(CONFIG.get("now_update_interval_seconds", 12)))
 # auto-disconnect when idle and no interactions (seconds) — v2.6: 180s, silent
 AUTO_DISCONNECT_SECONDS = 180
-VERSION = "v2.7.1"
+VERSION = "v2.8.1"
 
 # v2.7.1: helpers to persist config and change runtime profile
 def _persist_config():
@@ -93,8 +94,10 @@ def set_stream_profile(profile: str) -> str:
     p = (profile or "").lower().strip()
     if p in ("low_latency", "low", "fast"):
         p = "low-latency"
-    if p not in ("stable", "low-latency"):
-        raise ValueError("Profile phải là 'stable' hoặc 'low-latency'")
+    if p in ("super", "ultra", "ultra-low", "ultra_low", "super_low_latency", "super-low", "sll", "ull"):
+        p = "super-low-latency"
+    if p not in ("stable", "low-latency", "super-low-latency"):
+        raise ValueError("Profile phải là 'stable', 'low-latency' hoặc 'super-low-latency'")
     STREAM_PROFILE = p
     try:
         CONFIG["stream_profile"] = p
@@ -156,7 +159,8 @@ tree = bot.tree
 # yt-dlp / ffmpeg
 # Use flexible format and UA header to reduce 403 & format problems
 YTDL_OPTS = {
-    "format": "bestaudio/best",
+    # Prefer m4a (MP4/AAC) or opus-without-video for more consistent seeking and startup
+    "format": "bestaudio[ext=m4a]/bestaudio[acodec~='opus'][vcodec=none]/bestaudio/best",
     "quiet": True,
     "nocheckcertificate": True,
     "ignoreerrors": False,
@@ -178,7 +182,29 @@ YTDL_OPTS = {
 }
 ytdl = YoutubeDL(YTDL_OPTS)
 # Base reconnect options shared by profiles; v2.7 adds eof reconnect
-FFMPEG_BEFORE_BASE = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -reconnect_at_eof 1 -rw_timeout 15000000 -nostdin"
+FFMPEG_BEFORE_BASE = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -reconnect_at_eof 1 -rw_timeout 15000000 -nostdin -http_persistent 1 -seekable 1 -thread_queue_size 1024"
+
+# v2.8.0: bug report path
+BUG_REPORT_LOG_PATH = "report_bug.log"
+
+def _sanitize_stream_url(u: Optional[str]) -> Optional[str]:
+    """Strip problematic query params (like range=) that can cause mid-track starts.
+
+    Many YouTube formats sometimes include a pre-filled byte range which makes FFmpeg
+    start decoding somewhere in the middle of the file. Removing these params forces
+    FFmpeg to fetch from the beginning when possible.
+    """
+    if not u:
+        return u
+    try:
+        pr = urlparse(u)
+        q = parse_qsl(pr.query, keep_blank_values=True)
+        # Remove range-related hints; keep stable params
+        filtered = [(k, v) for (k, v) in q if k.lower() not in ("range", "rn", "rbuf")]
+        new_q = urlencode(filtered)
+        return urlunparse((pr.scheme, pr.netloc, pr.path, pr.params, new_q, pr.fragment))
+    except Exception:
+        return u
 
 # Playlist persistence removed: playlist commands removed.
 
@@ -279,7 +305,7 @@ async def _cache_cleanup_loop():
 # helper to choose a usable audio URL from formats
 def _pick_best_audio_url(info: dict) -> Optional[str]:
     if info.get("url"):
-        return info.get("url")
+        return _sanitize_stream_url(info.get("url"))
     formats = info.get("formats") or []
     if not formats:
         return None
@@ -317,7 +343,7 @@ def _pick_best_audio_url(info: dict) -> Optional[str]:
         return s
 
     best = max(candidates, key=score)
-    return best.get("url")
+    return _sanitize_stream_url(best.get("url"))
 
 # Async deque backed queue (single source of truth for playlist)
 class AsyncDequeQueue:
@@ -481,6 +507,8 @@ class YTDLTrack:
                 picked = _pick_best_audio_url(data)
                 if picked:
                     data["url"] = picked
+            else:
+                data["url"] = _sanitize_stream_url(data["url"]) or data["url"]
 
             if not data.get("url"):
                 raise RuntimeError("Không lấy được stream URL từ nguồn")
@@ -519,18 +547,27 @@ class YTDLTrack:
 # audio creation
 def _ffmpeg_options_for_profile(volume: float):
     vol = max(0.0, min(float(volume), 4.0))
-    if STREAM_PROFILE == "low-latency":
-        opts = f'-vn -af "volume={vol}" -b:a {FFMPEG_BITRATE} -ar 48000 -threads {FFMPEG_THREADS} ' \
-               f'-nostats -loglevel error -probesize 32k -analyzeduration 0'
-        before = FFMPEG_BEFORE_BASE
+    if STREAM_PROFILE == "super-low-latency":
+     # Extreme low-latency: tiniest probe/analyze, no input buffering. Requires strong CPU/network.
+     # Notes: may stutter on unstable links. Best when bot is close to Discord region.
+     opts = f'-vn -af "volume={vol}" -b:a {FFMPEG_BITRATE} -ar 48000 -threads {FFMPEG_THREADS} ' \
+         f'-nostats -loglevel error -probesize 16k -analyzeduration 0 -bufsize 256k -rtbufsize 256k ' \
+         f'-fflags nobuffer -flags low_delay -max_delay 0 -reorder_queue_size 0 -flush_packets 1'
+     before = FFMPEG_BEFORE_BASE
+    elif STREAM_PROFILE == "low-latency":
+     # Lower analyzeduration/probesize to start faster, keep reasonable buffers to reduce stutter
+     opts = f'-vn -af "volume={vol}" -b:a {FFMPEG_BITRATE} -ar 48000 -threads {FFMPEG_THREADS} ' \
+         f'-nostats -loglevel error -probesize 64k -analyzeduration 100000 -bufsize 512k -rtbufsize 512k'
+     before = FFMPEG_BEFORE_BASE
     else:  # stable
-        opts = f'-vn -af "volume={vol}" -b:a {FFMPEG_BITRATE} -ar 48000 -threads {FFMPEG_THREADS} ' \
-               f'-nostats -loglevel error -probesize 256k -analyzeduration 1000000 -bufsize 1M -rtbufsize 1M'
-        before = FFMPEG_BEFORE_BASE
+     opts = f'-vn -af "volume={vol}" -b:a {FFMPEG_BITRATE} -ar 48000 -threads {FFMPEG_THREADS} ' \
+         f'-nostats -loglevel error -probesize 256k -analyzeduration 1000000 -bufsize 1M -rtbufsize 1M'
+     before = FFMPEG_BEFORE_BASE
     return before, opts
 
 
 def create_audio_source(stream_url: str, volume: float = 1.0):
+    stream_url = _sanitize_stream_url(stream_url) or stream_url
     before, options = _ffmpeg_options_for_profile(volume)
     kwargs = {"before_options": before, "options": options}
     try:
@@ -791,7 +828,7 @@ class MusicPlayer:
         embed.add_field(name="⏱️ Thời lượng", value=format_duration(data.get("duration")), inline=True)
         if data.get("requested_by"):
             embed.add_field(name="🙋 Yêu cầu", value=truncate(data.get("requested_by"), 30), inline=True)
-        embed.set_footer(text="Monica • v2.7.1 ✨")
+        embed.set_footer(text="Monica v2.8.1 • Nếu gặp lỗi hãy dùng /report để được hỗ trợ nhanh ✨")
         return embed
 
     async def _player_loop(self):
@@ -1076,7 +1113,7 @@ class MusicControls(ui.View):
             pass
         return True
 
-    @ui.button(emoji="⏯️", style=discord.ButtonStyle.primary, row=0)
+    @ui.button(emoji="⏯️", label="Tạm dừng/Tiếp tục", style=discord.ButtonStyle.primary, row=0)
     async def pause_resume(self, inter: discord.Interaction, button: ui.Button):
         vc = discord.utils.get(bot.voice_clients, guild=inter.guild)
         if not vc or not getattr(vc, "source", None):
@@ -1089,14 +1126,14 @@ class MusicControls(ui.View):
         else:
             await inter.response.send_message("Không thể điều chỉnh hiện tại", ephemeral=True)
 
-    @ui.button(emoji="⏭️", style=discord.ButtonStyle.secondary, row=0)
+    @ui.button(emoji="⏭️", label="Bỏ qua", style=discord.ButtonStyle.secondary, row=0)
     async def skip(self, inter: discord.Interaction, button: ui.Button):
         vc = discord.utils.get(bot.voice_clients, guild=inter.guild)
         if not vc or not vc.is_playing():
             await inter.response.send_message("Không có bài nhạc nào để bỏ qua", ephemeral=True); return
         vc.stop(); await inter.response.send_message("⏭️ Đã bỏ qua bài nhạc", ephemeral=True)
 
-    @ui.button(emoji="⏹️", style=discord.ButtonStyle.danger, row=0)
+    @ui.button(emoji="⏹️", label="Dừng phát", style=discord.ButtonStyle.danger, row=0)
     async def stop(self, inter: discord.Interaction, button: ui.Button):
         vc = discord.utils.get(bot.voice_clients, guild=inter.guild)
         if vc:
@@ -1132,7 +1169,7 @@ class MusicControls(ui.View):
                 pass
         await inter.response.send_message("⏹️ Đã dừng phát và xóa hàng đợi", ephemeral=True)
 
-    @ui.button(emoji="📜", style=discord.ButtonStyle.secondary, row=1)
+    @ui.button(emoji="📜", label="Hàng đợi", style=discord.ButtonStyle.secondary, row=1)
     async def show_queue(self, inter: discord.Interaction, button: ui.Button):
         player = players.get(inter.guild.id)
         if not player or player.queue.empty():
@@ -1145,7 +1182,7 @@ class MusicControls(ui.View):
         embed = discord.Embed(title="Queue (next up)", description=text or "Trống", color=0x2F3136)
         await inter.response.send_message(embed=embed, ephemeral=True)
 
-    @ui.button(emoji="🔁", style=discord.ButtonStyle.primary, row=1)
+    @ui.button(emoji="🔁", label="Loop", style=discord.ButtonStyle.primary, row=1)
     async def toggle_loop(self, inter: discord.Interaction, button: ui.Button):
         player = players.get(inter.guild.id)
         if not player:
@@ -1153,7 +1190,7 @@ class MusicControls(ui.View):
         player.loop_mode = not player.loop_mode
         await inter.response.send_message(f"🔁 Loop {'Bật' if player.loop_mode else 'Tắt'}", ephemeral=True)
 
-    @ui.button(emoji="↩️", style=discord.ButtonStyle.secondary, row=1)
+    @ui.button(emoji="↩️", label="Quay lại", style=discord.ButtonStyle.secondary, row=1)
     async def reverse(self, inter: discord.Interaction, button: ui.Button):
         """Requeue the last played track (from history) and play it next.
 
@@ -1173,13 +1210,74 @@ class MusicControls(ui.View):
             return
         await inter.response.send_message(f"↩️ Đang chuyển về: {truncate(last.get('title') if isinstance(last, dict) else str(last), 80)}", ephemeral=True)
 
+
+# v2.8.0: Report Modal and commands
+class ReportModal(ui.Modal, title="Báo cáo lỗi gặp phải"):
+    ten_loi = ui.TextInput(label="Tên lỗi bạn gặp", placeholder="VD: Bị giật, delay, không phát được…", required=True, max_length=120)
+    chuc_nang = ui.TextInput(label="Chức năng liên quan đến lỗi", placeholder="VD: play, skip, reverse, queue…", required=True, max_length=80)
+    mo_ta = ui.TextInput(label="Mô tả chi tiết tình trạng gặp lỗi", style=discord.TextStyle.paragraph, required=True, max_length=1500)
+
+    def __init__(self, user: discord.abc.User, guild: Optional[discord.Guild]):
+        super().__init__()
+        self._user = user
+        self._guild = guild
+
+    async def on_submit(self, interaction: discord.Interaction):
+        # Append to report_bug.log in UTF-8
+        try:
+            with open(BUG_REPORT_LOG_PATH, "a", encoding="utf-8") as f:
+                ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+                gid = getattr(self._guild, 'id', None)
+                gname = getattr(self._guild, 'name', None)
+                f.write(
+                    (
+                        f"[{ts}] user={interaction.user} (id={interaction.user.id}) guild={gid}:{gname}\n"
+                        f"  Ten loi: {str(self.ten_loi)}\n"
+                        f"  Chuc nang: {str(self.chuc_nang)}\n"
+                        f"  Mo ta: {str(self.mo_ta)}\n"
+                        "---\n"
+                    )
+                )
+        except Exception:
+            logger.exception("Failed to write bug report")
+        await interaction.response.send_message("Cảm ơn bạn đã đóng góp! Báo cáo đã được ghi lại ❤️", ephemeral=True)
+
+
+@bot.command(name="report")
+async def text_report(ctx):
+    try:
+        await ctx.send("Vui lòng dùng lệnh slash /report để mở form báo cáo tương tác.")
+    except Exception:
+        pass
+
+
+@tree.command(name="report", description="Gửi báo cáo lỗi bạn đang gặp phải")
+async def slash_report(interaction: discord.Interaction):
+    try:
+        await interaction.response.send_modal(ReportModal(interaction.user, interaction.guild))
+    except Exception:
+        logger.exception("Failed to open report modal")
+        try:
+            await interaction.followup.send("Không thể mở form báo cáo ngay lúc này.", ephemeral=True)
+        except Exception:
+            pass
+
 # Events and commands
 @bot.event
 async def on_ready():
     logger.info("Bot ready: %s (ID: %s)", bot.user, bot.user.id)
     try:
+        # Global sync (may take up to 1 hour to propagate)
         await tree.sync()
-        logger.info("Synced application commands.")
+        logger.info("Global application commands synced.")
+        # Fast per-guild sync so commands appear instantly in joined servers
+        for g in bot.guilds:
+            try:
+                tree.copy_global_to(guild=g)
+                await tree.sync(guild=g)
+                logger.info("Per-guild commands synced for guild=%s (%s)", g.id, g.name)
+            except Exception:
+                logger.exception("Per-guild sync failed for guild %s", getattr(g, 'id', '?'))
     except Exception:
         logger.exception("Failed to sync commands")
     try:
@@ -1187,7 +1285,7 @@ async def on_ready():
     except Exception:
         pass
     try:
-        await bot.change_presence(activity=discord.Game(name="!play or !help to start vibing ✨"))
+        await bot.change_presence(activity=discord.Game(name="/play hoặc /help để bắt đầu ✨"))
     except Exception:
         pass
 
@@ -1326,7 +1424,7 @@ async def handle_play_request(ctx_or_interaction, query: str):
             embed.add_field(name="👤 Nghệ sĩ", value=truncate(track.data.get("uploader"), 64), inline=True)
         if track.data.get("duration"):
             embed.add_field(name="⏱️ Thời lượng", value=format_duration(track.data.get("duration")), inline=True)
-        embed.set_footer(text="Monica • v2.7.1 ✨")
+        embed.set_footer(text="Nếu gặp lỗi bạn hãy báo cáo qua /report để được hỗ trợ sửa lỗi nhanh chóng cho bạn nhé ✨")
         if isinstance(ctx_or_interaction, discord.Interaction):
             # If the slash command was previously deferred, use followup to send the
             # message. Using response.send_message after a defer will fail and can
@@ -1491,15 +1589,15 @@ async def slash_now(interaction: discord.Interaction):
 async def text_profile(ctx, profile: Optional[str] = None):
     try:
         if not profile:
-            await ctx.send(f"Profile hiện tại: {STREAM_PROFILE} (stable|low-latency)")
+            await ctx.send(f"Profile hiện tại: {STREAM_PROFILE} (stable | low-latency | super-low-latency)")
             return
         newp = set_stream_profile(profile)
         await ctx.send(f"✅ Đã đặt profile: {newp}")
     except Exception as e:
         await ctx.send(f"❌ {e}")
 
-@tree.command(name="profile", description="Xem/đặt profile streaming (stable | low-latency)")
-@discord.app_commands.describe(mode="stable | low-latency (để trống để xem hiện tại)")
+@tree.command(name="profile", description="Xem/đặt profile streaming (stable | low-latency | super-low-latency)")
+@discord.app_commands.describe(mode="stable | low-latency | super-low-latency (để trống để xem hiện tại)")
 async def slash_profile(interaction: discord.Interaction, mode: Optional[str] = None):
     try:
         if not mode:
@@ -1682,7 +1780,7 @@ async def text_clear(ctx, *, title: str):
     else:
         await ctx.send(f"Không tìm thấy bài nào khớp với '{title}'.")
 
-@tree.command(name="clear", description="Xóa bài khỏi hàng đợi theo tên (partial match, case-insensitive)")
+@tree.command(name="clear", description="Xóa bài khỏi hàng đợi theo tên")
 async def slash_clear(interaction: discord.Interaction, title: str):
     player = players.get(interaction.guild.id)
     if not player:
@@ -1755,15 +1853,20 @@ async def text_help(ctx):
     )
     embed.add_field(name="/join  |  !join", value="Kêu bot vào kênh thoại của bạn", inline=False)
     embed.add_field(name="/play <query>  |  !play <query>", value="Thêm bài vào hàng đợi (link hoặc tên bài nhạc).", inline=False)
-    embed.add_field(name="/pause / /resume / /skip / /stop", value="Dừng / tiếp tục / bỏ qua / dừng và xóa hàng đợi", inline=False)
+    embed.add_field(name="/pause / /resume / /skip / /stop / /leave", value="Dừng / tiếp tục / bỏ qua / dừng và xóa hàng đợi / rời kênh", inline=False)
+    embed.add_field(name="/clear <tên> / /clear_all", value="Xóa mục theo tên (một phần) / xóa toàn bộ hàng đợi", inline=False)
     embed.add_field(name="/queue / /now / /volume", value="Xem hàng đợi (10 bài tiếp theo), hiển thị bài đang phát, đặt âm lượng", inline=False)
+    embed.add_field(name="/reverse / /loop_all / /unloop", value="Quay lại bài vừa phát / bật loop cho hàng đợi / tắt loop", inline=False)
+    embed.add_field(name="/profile / /stats / /version", value="Đặt profile phát (stable/low-latency/super-low-latency) / xem trạng thái / phiên bản", inline=False)
+    embed.add_field(name="/report  |  !report", value="Mở form để gửi báo cáo lỗi (Tên lỗi, chức năng, mô tả)", inline=False)
+    embed.add_field(name="Nút điều khiển", value="⏯️ Tạm dừng/Tiếp tục • ⏭️ Bỏ qua • ⏹️ Dừng phát • 📜 Hàng đợi • 🔁 Loop • ↩️ Quay lại", inline=False)
 
     disclaimer_text = (
         "Monica Music Bot chỉ được phép sử dụng cho mục đích cá nhân và không thương mại.\n"
         "Tác giả từ chối mọi trách nhiệm phát sinh từ việc sử dụng hoặc lạm dụng phần mềm này."
     )
     embed.add_field(name="Disclaimer", value=disclaimer_text, inline=False)
-    embed.set_footer(text="Monica Music Bot v2.7.1 • By shio")
+    embed.set_footer(text="Monica Music Bot v2.8.1 • By shio")
     await ctx.send(embed=embed)
 
 
@@ -1776,15 +1879,20 @@ async def slash_help(interaction: discord.Interaction):
     )
     embed.add_field(name="/join  |  !join", value="Kêu bot vào kênh thoại của bạn", inline=False)
     embed.add_field(name="/play <query>  |  !play <query>", value="Thêm bài vào hàng đợi (link hoặc tên).", inline=False)
-    embed.add_field(name="/pause / /resume / /skip / /stop", value="Dừng / tiếp tục / bỏ qua / dừng và xóa hàng đợi", inline=False)
+    embed.add_field(name="/pause / /resume / /skip / /stop / /leave", value="Dừng / tiếp tục / bỏ qua / dừng và xóa hàng đợi / rời kênh", inline=False)
+    embed.add_field(name="/clear <tên> / /clear_all", value="Xóa mục theo tên (một phần) / xóa toàn bộ hàng đợi", inline=False)
     embed.add_field(name="/queue / /now / /volume", value="Xem hàng đợi (10 bài tiếp theo), hiển thị bài đang phát, đặt âm lượng", inline=False)
+    embed.add_field(name="/reverse / /loop_all / /unloop", value="Quay lại bài vừa phát / bật loop cho hàng đợi / tắt loop", inline=False)
+    embed.add_field(name="/profile / /stats / /version", value="Đặt profile phát (stable/low-latency/super-low-latency) / xem trạng thái / phiên bản", inline=False)
+    embed.add_field(name="/report  |  !report", value="Mở form để gửi báo cáo lỗi (Tên lỗi, chức năng, mô tả)", inline=False)
+    embed.add_field(name="Nút điều khiển", value="⏯️ Tạm dừng/Tiếp tục • ⏭️ Bỏ qua • ⏹️ Dừng phát • 📜 Hàng đợi • 🔁 Loop • ↩️ Quay lại", inline=False)
 
     disclaimer_text = (
         "Monica Music Bot chỉ được phép sử dụng cho mục đích cá nhân và không thương mại.\n"
         "Tác giả từ chối mọi trách nhiệm phát sinh từ việc sử dụng hoặc lạm dụng phần mềm này."
     )
     embed.add_field(name="Disclaimer", value=disclaimer_text, inline=False)
-    embed.set_footer(text="Monica Music Bot v2.7.1 • By shio")
+    embed.set_footer(text="Monica Music Bot v2.8.1 • By shio")
 
     await interaction.response.send_message(embed=embed)
 
@@ -1794,7 +1902,7 @@ async def slash_help(interaction: discord.Interaction):
 async def on_command_error(ctx, error):
     logger.exception("Command error: %s", error)
     try:
-        await ctx.send("Đã có lỗi xảy ra. Mình đã ghi lại log để @khuonqtrn kiểm tra.")
+        await ctx.send("Bạn vui lòng kiểm tra lại lệnh của mình nhé :3\nMình đã ghi lại log cho shio kiểm tra để đề phòng lỗi", delete_after=10)
     except Exception:
         pass
 
@@ -1802,7 +1910,7 @@ async def on_command_error(ctx, error):
 async def on_app_command_error(interaction, error):
     logger.exception("App command error: %s", error)
     try:
-        await interaction.response.send_message("Đã có lỗi xảy ra. Mình đã ghi lại log để @khuonqtrn kiểm tra.", ephemeral=True)
+        await interaction.response.send_message("Bạn vui lòng kiểm tra lại lệnh của mình nhé :3\nMình đã ghi lại log cho shio kiểm tra để đề phòng lỗi", ephemeral=True)
     except Exception:
         pass
 
