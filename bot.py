@@ -73,7 +73,7 @@ DEFAULT_CONFIG = {
     "stream_profile": "stable",
     # how often to update the now-playing progress (seconds)
     "now_update_interval_seconds": 12,
-    "idle_disconnect_seconds": 900,
+    "idle_disconnect_seconds": 300,  # auto-disconnect after 5 minutes idle (was 900)
     "max_track_seconds": 0,
 }
 
@@ -106,7 +106,7 @@ IDLE_DISCONNECT_SECONDS = int(CONFIG.get("idle_disconnect_seconds", 900))
 # streaming profile and now-playing update interval
 STREAM_PROFILE = str(CONFIG.get("stream_profile", "stable")).lower().strip() or "stable"
 NOW_UPDATE_INTERVAL = max(5, int(CONFIG.get("now_update_interval_seconds", 12)))
-VERSION = "v3.4.2"  # Prefetch idle backoff + max_track_seconds enforcement polishing
+VERSION = "v3.4.3"  # Idle disconnect default 300s + player loop logic refinement
 GIT_COMMIT = os.getenv("GIT_COMMIT") or os.getenv("COMMIT_SHA") or None
 
 # Playback modes & Spotify removed. Supported sources only.
@@ -1170,7 +1170,10 @@ class MusicPlayer:
 
                 vc = discord.utils.get(self.bot.voice_clients, guild=self.guild)
                 if self.queue.empty() and (not vc or not vc.is_playing()):
-                    break
+                    # Instead of breaking (which left the bot connected indefinitely),
+                    # loop back and wait up to IDLE_DISCONNECT_SECONDS in queue.get().
+                    # If no new track arrives, the timeout branch above will disconnect.
+                    continue
 
         except asyncio.CancelledError:
             logger.info("Player loop cancelled guild=%s", self.guild.id)
@@ -1917,6 +1920,7 @@ def _format_stats(guild: Optional[discord.Guild] = None) -> str:
         f"Profile: {STREAM_PROFILE}",
         f"Prefetch: {'on' if PREFETCH_NEXT else 'off'}",
         f"Now update interval: {NOW_UPDATE_INTERVAL}s",
+    f"Idle disconnect: {IDLE_DISCONNECT_SECONDS}s",
         f"Cache entries: {len(_TRACK_CACHE)} (hits={ms.get('cache_hits')} miss={ms.get('cache_miss')})",
     f"Resolve: attempts={ms.get('resolve_attempts')} ok={ms.get('resolve_success')} fail={ms.get('resolve_fail')} circuit_open={ms.get('resolve_circuit_open')}",
     f"Resolve avg: {avg:.3f}s (n={count})",
@@ -1973,6 +1977,7 @@ async def text_health(ctx):
         pass
     lines.append(f"FFmpeg restarts: {ms.get('ffmpeg_restarts')}")
     lines.append(f"Profile: {STREAM_PROFILE}")
+    lines.append(f"Idle disconnect: {IDLE_DISCONNECT_SECONDS}s")
     lines.append(f"Prefetch: resolved={ms.get('prefetch_resolved')} idle_cycles={ms.get('prefetch_idle_cycles')}")
     await ctx.send(f"```\n" + "\n".join(lines) + "\n```")
 
@@ -2007,6 +2012,7 @@ async def slash_health(interaction: discord.Interaction):
         pass
     lines.append(f"FFmpeg restarts: {ms.get('ffmpeg_restarts')}")
     lines.append(f"Profile: {STREAM_PROFILE}")
+    lines.append(f"Idle disconnect: {IDLE_DISCONNECT_SECONDS}s")
     lines.append(f"Prefetch: resolved={ms.get('prefetch_resolved')} idle_cycles={ms.get('prefetch_idle_cycles')}")
     await interaction.response.send_message(f"```\n" + "\n".join(lines) + "\n```", ephemeral=True)
 
