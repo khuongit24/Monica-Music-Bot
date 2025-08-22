@@ -27,19 +27,19 @@ Việc sử dụng phần mềm để tải xuống, phát trực tuyến hoặc
 
 ## Tính năng chính
 
-Phát nhạc
+Phát nhạc:
 - /join • /play <query> • /pause • /resume • /skip • /stop • /leave
-- Hàng đợi
+- Hàng đợi:
 - /queue • /clear <tên> • /clear_all • /reverse
-- Loop / Lịch sử
+- Loop / Lịch sử:
 - /loop (loop 1 bài) • /loop_all (loop hàng đợi) • /unloop (tắt cả hai) • /reverse
-- Thông tin / Giám sát
+- Thông tin / Giám sát:
 - /now • /stats • /health • /metrics • /version
-- Cấu hình / Debug
+- Cấu hình / Debug:
 - /profile • /volume • /debug_track <query> • /config_show
-- Báo cáo
+- Báo cáo:
 - /report (hoặc !report) để mở form gửi lỗi / góp ý
-- Nguồn hỗ trợ
+- Nguồn hỗ trợ:
 - YouTube • SoundCloud • Bandcamp • Mixcloud • Audius
 
 
