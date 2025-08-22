@@ -12,7 +12,5 @@
   "now_update_interval_seconds": 12,
   "idle_disconnect_seconds": 300,
   "playback_mode": "global",
-  "spotify_client_id": "",
-  "spotify_client_secret": "",
   "cache_ttl_seconds": 3600
 }
