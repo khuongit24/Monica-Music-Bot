@@ -51,10 +51,11 @@ Khi nhận được một counter‑notice hợp lệ, chúng tôi có thể g�
 
 Để nộp yêu cầu gỡ bỏ bản quyền, phản hồi hoặc các vấn đề pháp lý khác, vui lòng gửi email tới địa chỉ pháp lý chính thức của dự án hoặc tác giả. **Vui lòng thay thế thông tin dưới đây bằng thông tin liên hệ thực tế trước khi công bố trong repository.**
 
-- Email pháp lý (ví dụ): `legal@example.com`
+- Email pháp lý: `tkhuong1915@gmail.com`
 - Trong phần tiêu đề email, ghi rõ: "DMCA Takedown Notice" hoặc "DMCA Counter‑Notice" và kèm theo thông tin chi tiết theo Mục 5.
 
 ## 7. Các điều khoản khác
 
 - Tuyên bố này không nhằm thay thế tư vấn pháp lý chuyên nghiệp. Nếu bạn cần hướng dẫn pháp lý cụ thể, vui lòng liên hệ luật sư hoặc đại diện pháp lý tại khu vực của bạn.
 - Chúng tôi khuyến nghị các bên tuân thủ tốt nhất các chuẩn mực nghề nghiệp và pháp lý khi nộp khiếu nại liên quan đến bản quyền.
+
