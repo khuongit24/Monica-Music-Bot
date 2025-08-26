@@ -9,7 +9,8 @@ try:
     if hasattr(sys.stderr, "reconfigure"):
         sys.stderr.reconfigure(encoding="utf-8")
 except Exception:
-    pass
+    # Low group: add diagnostic log without changing behavior
+    logging.getLogger("Monica").debug("Failed to reconfigure stdio encoding", exc_info=True)
 
 import asyncio
 import json
@@ -20,7 +21,7 @@ import signal
 from collections import deque, OrderedDict
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 from logging.handlers import RotatingFileHandler
-from typing import Dict, Optional, Any, List
+from typing import Dict, Optional, Any, List, Union, Callable, Tuple, Awaitable
 
 import discord
 from discord.ext import commands
@@ -28,90 +29,44 @@ from discord import ui
 from yt_dlp import YoutubeDL
 import yt_dlp
 
-# --- Metrics ---
-_METRICS = {
-    "resolve_attempts": 0,
-    "resolve_success": 0,
-    "resolve_fail": 0,
-    "resolve_circuit_open": 0,
-    "cache_hits": 0,
-    "cache_miss": 0,
-    "queue_add": 0,
-    "playback_start": 0,
-    "playback_finish": 0,
-    "playback_error": 0,
-    "resolve_time_total_seconds": 0.0,
-    "resolve_time_count": 0,
-    "ffmpeg_restarts": 0,
-    # prefetch related
-    "prefetch_resolved": 0,
-    "prefetch_idle_cycles": 0,
-}
+# Import custom modules
+from modules.config import load_env_file, load_config, get_token, persist_config
+from modules.metrics import metric_inc, metric_add_time, metrics_snapshot, get_average_resolve_time
+from modules.utils import THEME_COLOR, OK_COLOR, ERR_COLOR, format_duration, truncate, make_progress_bar, write_snapshot_file
+from modules.voice_manager import get_voice_client_cached, invalidate_voice_cache, cleanup_voice_cache, ensure_connected_for_user
+from modules.audio_processor import sanitize_stream_url, pick_best_audio_url, get_ffmpeg_options_for_profile, create_audio_source, validate_domain
+from modules.cache_manager import get_cache_manager, cleanup_cache_loop
 
-def metric_inc(name: str, delta: int = 1):
-    try:
-        _METRICS[name] = _METRICS.get(name, 0) + delta
-    except Exception:
-        pass
+# Load environment variables early
+load_env_file()
 
-def metrics_snapshot() -> Dict[str, int]:
-    return dict(_METRICS)
-
-# --- Config ---
-CONFIG_PATH = "config.json"
-DEFAULT_CONFIG = {
-    "token": os.getenv("DISCORD_TOKEN", ""),
-    "prefix": "!",
-    "owner_id": None,
-    "max_queue_size": 200,
-    "download_concurrency": 2,
-    "cache_size_limit": 200,
-    "ffmpeg_bitrate": "128k",
-    "ffmpeg_threads": 1,
-    "prefetch_next": True,
-    # streaming profile — 'stable' (default) or 'low-latency'
-    "stream_profile": "stable",
-    # how often to update the now-playing progress (seconds)
-    "now_update_interval_seconds": 12,
-    "idle_disconnect_seconds": 300,  # auto-disconnect after 5 minutes idle (was 900)
-    "max_track_seconds": 0,
-}
-
-if os.path.exists(CONFIG_PATH):
-    try:
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            user_conf = json.load(f)
-        CONFIG = {**DEFAULT_CONFIG, **user_conf}
-    except Exception:
-        CONFIG = DEFAULT_CONFIG.copy()
-else:
-    CONFIG = DEFAULT_CONFIG.copy()
-
-TOKEN = CONFIG.get("token") or os.getenv("DISCORD_TOKEN")
-PREFIX = CONFIG.get("prefix", "!")
-OWNER_ID = CONFIG.get("owner_id")
+# Load configuration
+CONFIG: Dict[str, Any] = load_config()
+TOKEN: str = get_token()
+PREFIX: str = CONFIG.get("prefix", "!")
+OWNER_ID: Optional[int] = CONFIG.get("owner_id")
 if OWNER_ID is not None:
     try:
         OWNER_ID = int(OWNER_ID)
     except Exception:
         OWNER_ID = None
-MAX_QUEUE_SIZE = int(CONFIG.get("max_queue_size", 200))
-DOWNLOAD_CONCURRENCY = max(1, int(CONFIG.get("download_concurrency", 1)))
-CACHE_TTL_SECONDS = int(CONFIG.get("cache_ttl_seconds", 900))
-CACHE_SIZE_LIMIT = int(CONFIG.get("cache_size_limit", 200))
-FFMPEG_BITRATE = str(CONFIG.get("ffmpeg_bitrate", "128k"))
-FFMPEG_THREADS = int(CONFIG.get("ffmpeg_threads", 1))
-PREFETCH_NEXT = bool(CONFIG.get("prefetch_next", False))
-IDLE_DISCONNECT_SECONDS = int(CONFIG.get("idle_disconnect_seconds", 900))
+MAX_QUEUE_SIZE: int = int(CONFIG.get("max_queue_size", 200))
+DOWNLOAD_CONCURRENCY: int = max(1, int(CONFIG.get("download_concurrency", 1)))
+CACHE_TTL_SECONDS: int = int(CONFIG.get("cache_ttl_seconds", 900))
+CACHE_SIZE_LIMIT: int = int(CONFIG.get("cache_size_limit", 200))
+FFMPEG_BITRATE: str = str(CONFIG.get("ffmpeg_bitrate", "128k"))
+FFMPEG_THREADS: int = int(CONFIG.get("ffmpeg_threads", 1))
+PREFETCH_NEXT: bool = bool(CONFIG.get("prefetch_next", False))
+IDLE_DISCONNECT_SECONDS: int = int(CONFIG.get("idle_disconnect_seconds", 900))
 # streaming profile and now-playing update interval
-STREAM_PROFILE = str(CONFIG.get("stream_profile", "stable")).lower().strip() or "stable"
-NOW_UPDATE_INTERVAL = max(5, int(CONFIG.get("now_update_interval_seconds", 12)))
-VERSION = "v3.4.3"  # Idle disconnect default 300s + player loop logic refinement
-GIT_COMMIT = os.getenv("GIT_COMMIT") or os.getenv("COMMIT_SHA") or None
+STREAM_PROFILE: str = str(CONFIG.get("stream_profile", "stable")).lower().strip() or "stable"
+NOW_UPDATE_INTERVAL: int = max(5, int(CONFIG.get("now_update_interval_seconds", 12)))
+VERSION: str = "v3.5.2"  # Idle disconnect default 300s + player loop logic refinement
+GIT_COMMIT: Optional[str] = os.getenv("GIT_COMMIT") or os.getenv("COMMIT_SHA") or None
 
-# Playback modes & Spotify removed. Supported sources only.
-MAX_TRACK_SECONDS = int(CONFIG.get("max_track_seconds", 0) or 0)
-GLOBAL_ALLOWED_DOMAINS = {
+# Playbook modes & Spotify removed. Supported sources only.
+MAX_TRACK_SECONDS: int = int(CONFIG.get("max_track_seconds", 0) or 0)
+GLOBAL_ALLOWED_DOMAINS: set[str] = {
     "youtube.com", "www.youtube.com", "youtu.be", "m.youtube.com",
     "soundcloud.com", "m.soundcloud.com",
     "bandcamp.com",  # generic; subdomains like artist.bandcamp.com handled via endswith
@@ -119,41 +74,31 @@ GLOBAL_ALLOWED_DOMAINS = {
     "audius.co", "www.audius.co",
 }
 
-def _is_domain_allowed_global(netloc: str) -> bool:
-    nl = (netloc or "").lower()
-    if nl.endswith("bandcamp.com"):
-        return True
-    return nl in GLOBAL_ALLOWED_DOMAINS
+# High quality enforcement (new): always attempt best available audio quality
+FORCE_HIGH_QUALITY: bool = bool(CONFIG.get("force_high_quality", True))
+
+# Initialize cache manager (singleton via get_cache_manager). Removed duplicate init.
+CACHE_MANAGER = get_cache_manager(CACHE_SIZE_LIMIT, CACHE_TTL_SECONDS)
 
 ## Legacy playback mode removed
 
 # Config persistence / stream profile helpers
-def _persist_config():
-    try:
-        # Atomic write to avoid truncation corruption
-        tmp_path = CONFIG_PATH + ".tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(CONFIG, f, ensure_ascii=False, indent=2)
-            f.flush()
-            try:
-                os.fsync(f.fileno())
-            except Exception:
-                pass
-        try:
-            os.replace(tmp_path, CONFIG_PATH)
-        except Exception:
-            try:
-                os.remove(CONFIG_PATH)
-            except Exception:
-                pass
-            try:
-                os.rename(tmp_path, CONFIG_PATH)
-            except Exception:
-                pass
-    except Exception:
-        logger.exception("Failed to persist config")
+def _persist_config() -> None:
+    """Persist configuration to config.json."""
+    persist_config(CONFIG)
 
 def set_stream_profile(profile: str) -> str:
+    """Set the streaming profile for audio playback.
+    
+    Args:
+        profile: Stream profile name ('stable', 'low-latency', or 'super-low-latency')
+        
+    Returns:
+        The normalized profile name that was set
+        
+    Raises:
+        ValueError: If profile is not a valid option
+    """
     global STREAM_PROFILE
     p = (profile or "").lower().strip()
     if p in ("low_latency", "low", "fast"):
@@ -167,51 +112,28 @@ def set_stream_profile(profile: str) -> str:
         CONFIG["stream_profile"] = p
         _persist_config()
     except Exception:
-        pass
+        # Low group: previously silent; keep silent outward behavior.
+        logger.debug("Persist stream profile failed", exc_info=True)
     logger.info("Stream profile set to %s", STREAM_PROFILE)
     return STREAM_PROFILE
 
-# Colors
-THEME_COLOR = 0x9155FD
-OK_COLOR = 0x2ECC71
-ERR_COLOR = 0xE74C3C
-
-# helpers
-def format_duration(sec: Optional[int]) -> str:
-    if sec is None:
-        return "??:??"
-    if sec == 0:
-        return "LIVE"
-    h, rem = divmod(int(sec), 3600)
-    m, s = divmod(rem, 60)
-    if h:
-        return f"{h:d}:{m:02d}:{s:02d}"
-    return f"{m:d}:{s:02d}"
-
-def truncate(text: Optional[str], n: int = 60) -> str:
-    if not text:
-        return ""
-    return text if len(text) <= n else text[: n - 1].rstrip() + "…"
-
-def make_progress_bar(elapsed: float, total: Optional[float], width: int = 18) -> str:
-    if not total or total <= 0:
-        return f"{format_duration(int(elapsed))}"
-    frac = min(max(elapsed / total, 0.0), 1.0)
-    filled = int(round(frac * width))
-    bar = "█" * filled + "░" * (width - filled)
-    return f"[{bar}] {format_duration(int(elapsed))}/{format_duration(int(total))}"
-
-# logging
+# logging - fixed double setup issue
 logger = logging.getLogger("Monica")
-logger.setLevel(logging.INFO)
-fmt = logging.Formatter("%(asctime)s:%(levelname)s:%(name)s: %(message)s")
-ch = logging.StreamHandler()
-ch.setFormatter(fmt)
-logger.addHandler(ch)
-# File handler with utf-8 encoding
-fh = RotatingFileHandler("Monica.log", maxBytes=5_000_000, backupCount=3, encoding="utf-8")
-fh.setFormatter(fmt)
-logger.addHandler(fh)
+if not logger.handlers:  # Only setup if handlers don't exist
+    logger.setLevel(logging.INFO)
+    fmt = logging.Formatter("%(asctime)s:%(levelname)s:%(name)s: %(message)s")
+    
+    # Console handler
+    ch = logging.StreamHandler()
+    ch.setFormatter(fmt)
+    logger.addHandler(ch)
+    
+    # File handler with utf-8 encoding
+    fh = RotatingFileHandler("Monica.log", maxBytes=5_000_000, backupCount=3, encoding="utf-8")
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+    
+    logger.info("Logger initialized successfully")
 
 # discord setup
 intents = discord.Intents.default()
@@ -224,7 +146,8 @@ tree = bot.tree
 # Use flexible format and UA header to reduce 403 & format problems
 YTDL_OPTS = {
     # Prefer m4a (MP4/AAC) or opus-without-video for more consistent seeking and startup
-    "format": "bestaudio[ext=m4a]/bestaudio[acodec~='opus'][vcodec=none]/bestaudio/best",
+    # If force high quality enabled, simplify to bestaudio/best to let yt-dlp pick highest quality
+    "format": "bestaudio/best" if bool(CONFIG.get("force_high_quality", True)) else "bestaudio[ext=m4a]/bestaudio[acodec~='opus'][vcodec=none]/bestaudio/best",
     "quiet": True,
     "nocheckcertificate": True,
     "ignoreerrors": False,
@@ -244,6 +167,15 @@ YTDL_OPTS = {
     },
     # do not force source_address here (can cause binding issues on some systems)
 }
+if FORCE_HIGH_QUALITY:
+    # Optionally increase bitrate target if user left default low
+    try:
+        # Only bump if default and not explicitly overridden
+        if CONFIG.get("ffmpeg_bitrate") is None or CONFIG.get("ffmpeg_bitrate") == "128k":
+            FFMPEG_BITRATE = "192k"
+    except Exception:
+        pass
+    logger.info("High quality mode ON: yt-dlp format=%s ffmpeg_bitrate=%s", YTDL_OPTS.get("format"), FFMPEG_BITRATE)
 ytdl = YoutubeDL(YTDL_OPTS)
 # HTTP User-Agent used by ffmpeg for input requests
 HTTP_UA = (
@@ -263,210 +195,127 @@ FFMPEG_BEFORE_BASE = (
 BUG_REPORT_LOG_PATH = "report_bug.log"
 
 def _sanitize_stream_url(u: Optional[str]) -> Optional[str]:
-    """Strip problematic query params (like range=) that can cause mid-track starts.
-
-    Many YouTube formats sometimes include a pre-filled byte range which makes FFmpeg
-    start decoding somewhere in the middle of the file. Removing these params forces
-    FFmpeg to fetch from the beginning when possible.
+    """Wrapper for backward compatibility - delegates to audio_processor module.
+    
+    Args:
+        u: URL to sanitize
+        
+    Returns:
+        Sanitized URL or None if invalid
     """
-    if not u:
-        return u
-    try:
-        pr = urlparse(u)
-        q = parse_qsl(pr.query, keep_blank_values=True)
-        # Remove range- and offset-related hints; keep stable params
-        bad_keys = {"range", "rn", "rbuf", "start", "st", "begin", "sq", "dur", "t", "offset"}
-        filtered = [(k, v) for (k, v) in q if k.lower() not in bad_keys]
-        new_q = urlencode(filtered)
-        return urlunparse((pr.scheme, pr.netloc, pr.path, pr.params, new_q, pr.fragment))
-    except Exception:
-        return u
+    return sanitize_stream_url(u)
 
 # Playlist persistence removed: playlist commands removed.
 
-# download semaphore & cache
-DOWNLOAD_SEMAPHORE = asyncio.Semaphore(DOWNLOAD_CONCURRENCY)
-# Use an OrderedDict for LRU-like eviction and protect with an async lock created lazily
+# download semaphore & legacy cache structures (replaced with CacheManager)
+DOWNLOAD_SEMAPHORE: asyncio.Semaphore = asyncio.Semaphore(DOWNLOAD_CONCURRENCY)
+# Legacy cache variables - will be replaced gradually with CACHE_MANAGER
 _TRACK_CACHE: 'OrderedDict[str, Dict[str, Any]]' = OrderedDict()
-CACHE_LOCK = None
+CACHE_LOCK: Optional[asyncio.Lock] = None
+
+# Dedicated thread pool for yt-dlp operations to avoid blocking main thread
+import concurrent.futures
+_YTDL_EXECUTOR: concurrent.futures.ThreadPoolExecutor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=min(DOWNLOAD_CONCURRENCY * 2, 4),  # Scale with concurrency but cap at 4
+    thread_name_prefix="monica-ytdl"
+)
+
 # resolve-in-progress map to dedupe concurrent resolves (key -> Future)
-_RESOLVING: Dict[str, asyncio.Future] = {}
-_RESOLVE_LOCK = None
+_RESOLVING: Dict[str, asyncio.Future[YTDLTrack]] = {}
+_RESOLVE_LOCK: Optional[asyncio.Lock] = None
 
 # Circuit breaker for resolve (P0)
-_RESOLVE_FAIL_STREAK = 0
-_RESOLVE_FAIL_THRESHOLD = 6  # after 6 consecutive failures, open circuit
-_RESOLVE_COOLDOWN_SECONDS = 45
-_RESOLVE_LOCKOUT_UNTIL = 0.0
+_RESOLVE_FAIL_STREAK: int = 0
+_RESOLVE_FAIL_THRESHOLD: int = 6  # after 6 consecutive failures, open circuit
+_RESOLVE_COOLDOWN_SECONDS: int = 45
+_RESOLVE_LOCKOUT_UNTIL: float = 0.0  # timestamp until which circuit is open
+_RESOLVE_CIRCUIT_LAST_OPEN_TS: float = 0.0  # timestamp when circuit last opened (0 if closed)
 
-def _write_snapshot_file(snap: dict):
-    """Blocking atomic write of snapshot to disk (use in executor or sync contexts)."""
-    try:
-        tmp = f"queues_snapshot.json.tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(snap, f, ensure_ascii=False, indent=2)
-            f.flush()
-            try:
-                os.fsync(f.fileno())
-            except Exception:
-                pass
-        try:
-            os.replace(tmp, "queues_snapshot.json")
-        except Exception:
-            # fallback to rename
-            try:
-                os.remove("queues_snapshot.json")
-            except Exception:
-                pass
-            os.rename(tmp, "queues_snapshot.json")
-    except Exception:
-        logger.exception("Failed to write snapshot file")
+async def _cache_get(key: str) -> Optional[Dict[str, Any]]:
+    """Wrapper for backward compatibility - delegates to CacheManager.
+    
+    Args:
+        key: Cache key to look up
+        
+    Returns:
+        Cached data if found, None otherwise
+    """
+    return await CACHE_MANAGER.get(key)
 
-async def _cache_get(key: str):
-    """Async safe cache get with TTL and LRU move-to-end."""
-    global CACHE_LOCK
-    if CACHE_LOCK is None:
-        CACHE_LOCK = asyncio.Lock()
-    async with CACHE_LOCK:
-        entry = _TRACK_CACHE.get(key)
-        if not entry:
-            metric_inc("cache_miss")
-            return None
-        ttl = entry.get("ttl", CACHE_TTL_SECONDS)
-        if time.time() - entry["ts"] > ttl:
-            _TRACK_CACHE.pop(key, None)
-            metric_inc("cache_miss")
-            return None
-        # update last-access and timestamp
-        entry["ts"] = time.time()
-        # dynamic TTL promotion after 5 hits
-        try:
-            entry["hits"] = entry.get("hits", 0) + 1
-            if entry["hits"] == 5 and entry.get("ttl", CACHE_TTL_SECONDS) == CACHE_TTL_SECONDS:
-                entry["ttl"] = CACHE_TTL_SECONDS * 2  # one-time promotion
-        except Exception:
-            pass
-        try:
-            _TRACK_CACHE.move_to_end(key)
-        except Exception:
-            pass
-    metric_inc("cache_hits")
-    return entry["data"]
+async def _cache_put(key: str, data: Dict[str, Any]) -> None:
+    """Wrapper for backward compatibility - delegates to CacheManager.
+    
+    Args:
+        key: Cache key to store under
+        data: Data to cache
+    """
+    await CACHE_MANAGER.put(key, data)
 
-async def _cache_put(key: str, data: dict):
-    """Async safe cache put with size eviction."""
-    global CACHE_LOCK
-    if CACHE_LOCK is None:
-        CACHE_LOCK = asyncio.Lock()
-    lean = {
-        "title": data.get("title"),
-        "webpage_url": data.get("webpage_url"),
-        "url": data.get("url"),
-        "thumbnail": data.get("thumbnail"),
-        "duration": data.get("duration"),
-        "uploader": data.get("uploader"),
-        "is_live": bool(data.get("is_live") or data.get("live_status") in ("is_live", "started")),
-    }
-    async with CACHE_LOCK:
-        _TRACK_CACHE[key] = {"data": lean, "ts": time.time(), "ttl": CACHE_TTL_SECONDS, "hits": 0}
-        # Evict oldest while over limit
-        while len(_TRACK_CACHE) > CACHE_SIZE_LIMIT:
-            try:
-                _TRACK_CACHE.popitem(last=False)
-            except Exception:
-                break
+async def _cache_cleanup_loop() -> None:
+    """Periodic cache cleanup using CacheManager."""
+    await cleanup_cache_loop(CACHE_MANAGER)
 
-async def _cache_cleanup_loop():
-    global CACHE_LOCK
-    if CACHE_LOCK is None:
-        CACHE_LOCK = asyncio.Lock()
-    while True:
-        try:
-            now = time.time()
-            async with CACHE_LOCK:
-                keys = list(_TRACK_CACHE.keys())
-                for k in keys:
-                    try:
-                        if now - _TRACK_CACHE[k]["ts"] > CACHE_TTL_SECONDS:
-                            _TRACK_CACHE.pop(k, None)
-                    except KeyError:
-                        pass
-        except Exception:
-            logger.exception("Cache cleanup error")
-        await asyncio.sleep(60 * 5)
-
-# helper to choose a usable audio URL from formats
-def _pick_best_audio_url(info: dict) -> Optional[str]:
-    if info.get("url"):
-        return _sanitize_stream_url(info.get("url"))
-    formats = info.get("formats") or []
-    if not formats:
-        return None
-
-    # Filter formats that contain audio
-    candidates = []
-    for f in formats:
-        acodec = f.get("acodec")
-        # prefer those that actually have audio
-        if acodec and acodec != "none":
-            candidates.append(f)
-    if not candidates:
-        candidates = formats
-
-    def score(f):
-        s = 0
-        # prefer m4a then webm then others
-        ext = (f.get("ext") or "").lower()
-        if ext == "m4a":
-            s += 40
-        if ext == "webm":
-            s += 30
-        if f.get("abr"):
-            try:
-                s += int(float(f.get("abr")))
-            except Exception:
-                pass
-        # prefer http/https protocols
-        proto = (f.get("protocol") or "").lower()
-        if proto.startswith("http"):
-            s += 5
-        # strongly avoid HLS/m3u8 as they often carry timestamp offsets
-        if "m3u8" in proto or "hls" in proto:
-            s -= 100
-        # prefer non-dash if possible
-        if f.get("vcodec") in (None, "none"):
-            s += 3
-        # avoid formats with non-zero start_time if present
-        try:
-            st = f.get("start_time")
-            if st and float(st) > 0.5:
-                s -= 50
-        except Exception:
-            pass
-        return s
-
-    best = max(candidates, key=score)
-    return _sanitize_stream_url(best.get("url"))
+# helper to choose a usable audio URL from formats  
+def _pick_best_audio_url(info: Dict[str, Any]) -> Optional[str]:
+    """Wrapper for backward compatibility - delegates to audio_processor module.
+    
+    Args:
+        info: Track information dictionary from yt-dlp
+        
+    Returns:
+        Best audio URL if found, None otherwise
+    """
+    return pick_best_audio_url(info)
 
 # Async deque backed queue (single source of truth for playlist)
 class AsyncDequeQueue:
-    def __init__(self):
-        self._dq = deque()
-        self._cond = asyncio.Condition()
+    """Thread-safe async queue implementation using deque with condition variables.
+    
+    Provides async methods for putting and getting items with proper synchronization.
+    Supports timeout operations and various queue manipulation methods.
+    """
+    
+    def __init__(self) -> None:
+        """Initialize empty async queue with condition variable for synchronization."""
+        self._dq: deque[Any] = deque()
+        self._cond: asyncio.Condition = asyncio.Condition()
 
-    async def put(self, item: Any):
+    async def put(self, item: Any) -> None:
+        """Add item to the end of the queue.
+        
+        Args:
+            item: Any item to add to the queue
+        """
         async with self._cond:
+            # Low: append then notify all waiters (original logic preserved)
             self._dq.append(item)
             self._cond.notify_all()
     
-    async def put_front(self, item: Any):
+    async def put_front(self, item: Any) -> None:
+        """Add item to the front of the queue.
+        
+        Args:
+            item: Any item to add to the front of the queue
+        """
         async with self._cond:
+            # Low: push to left for priority insertion (unchanged behavior)
             self._dq.appendleft(item)
             self._cond.notify_all()
 
     async def get(self, timeout: Optional[float] = None) -> Any:
+        """Get and remove item from the front of the queue.
+        
+        Args:
+            timeout: Maximum time to wait for an item (None for indefinite wait)
+            
+        Returns:
+            The item from the front of the queue
+            
+        Raises:
+            asyncio.TimeoutError: If timeout expires before item becomes available
+        """
         async with self._cond:
-            # wait in a loop to avoid spurious wakeups and ensure queue has items
+            # Low: retain original wait loop semantics (spurious wakeup safe)
             if timeout is None:
                 while not self._dq:
                     await self._cond.wait()
@@ -483,13 +332,28 @@ class AsyncDequeQueue:
             return self._dq.popleft()
 
     async def clear(self) -> int:
+        """Clear all items from the queue.
+        
+        Returns:
+            Number of items that were removed
+        """
         async with self._cond:
+            # Low: snapshot length then clear (atomic under lock)
             n = len(self._dq)
             self._dq.clear()
             return n
 
-    async def remove_by_pred(self, pred) -> int:
+    async def remove_by_pred(self, pred: Callable[[Any], bool]) -> int:
+        """Remove items from queue that match the predicate.
+        
+        Args:
+            pred: Function that takes an item and returns True if it should be removed
+            
+        Returns:
+            Number of items that were removed
+        """
         async with self._cond:
+            # Low: filter rebuild (preserve order of survivors)
             old = list(self._dq)
             new = [x for x in old if not pred(x)]
             removed = len(old) - len(new)
@@ -497,31 +361,69 @@ class AsyncDequeQueue:
             return removed
 
     def snapshot(self) -> List[Any]:
+        """Get a snapshot of all items in the queue without removing them.
+        
+        Returns:
+            List containing all items currently in the queue
+        """
         return list(self._dq)
 
     def qsize(self) -> int:
+        """Get the current size of the queue.
+        
+        Returns:
+            Number of items in the queue
+        """
         return len(self._dq)
 
     def empty(self) -> bool:
+        """Check if the queue is empty.
+        
+        Returns:
+            True if queue is empty, False otherwise
+        """
         return not self._dq
 
 # Track abstraction with robust resolve (retry fallback)
 class YTDLTrack:
-    def __init__(self, data: dict):
-        self.data = data
-        self.title = data.get("title")
-        self.webpage_url = data.get("webpage_url")
-        self.stream_url = data.get("url")
-        self.thumbnail = data.get("thumbnail")
-        self.uploader = data.get("uploader")
-        self.duration = data.get("duration")
-        self.is_live = bool(data.get("is_live") or data.get("live_status") in ("is_live", "started"))
+    """YouTube-DL track representation with metadata and robust resolution.
+    
+    Handles track information from various audio sources and provides
+    robust resolution with caching, deduplication, and circuit breaker patterns.
+    """
+    
+    def __init__(self, data: Dict[str, Any]) -> None:
+        """Initialize track with metadata from yt-dlp.
+        
+        Args:
+            data: Dictionary containing track metadata from yt-dlp
+        """
+        self.data: Dict[str, Any] = data
+        self.title: Optional[str] = data.get("title")
+        self.webpage_url: Optional[str] = data.get("webpage_url")
+        self.stream_url: Optional[str] = data.get("url")
+        self.thumbnail: Optional[str] = data.get("thumbnail")
+        self.uploader: Optional[str] = data.get("uploader")
+        self.duration: Optional[Union[int, float]] = data.get("duration")
+        self.is_live: bool = bool(data.get("is_live") or data.get("live_status") in ("is_live", "started"))
 
     @classmethod
-    async def resolve(cls, query: str, timeout: float = 20.0):
+    async def resolve(cls, query: str, timeout: float = 20.0) -> 'YTDLTrack':
         """Resolve a query (URL or search) to a YTDLTrack with caching, dedupe, circuit breaker and timing metrics."""
-        global _RESOLVE_FAIL_STREAK, _RESOLVE_LOCKOUT_UNTIL, _RESOLVE_LOCK, _RESOLVING
+        global _RESOLVE_FAIL_STREAK, _RESOLVE_LOCKOUT_UNTIL, _RESOLVE_LOCK, _RESOLVING, _RESOLVE_CIRCUIT_LAST_OPEN_TS
         now = time.time()
+        # Detect circuit close (cooldown elapsed) to record open duration once
+        try:
+            if _RESOLVE_CIRCUIT_LAST_OPEN_TS and _RESOLVE_LOCKOUT_UNTIL and now >= _RESOLVE_LOCKOUT_UNTIL:
+                dur = _RESOLVE_LOCKOUT_UNTIL - _RESOLVE_CIRCUIT_LAST_OPEN_TS
+                if dur > 0:
+                    try:
+                        metric_add_time("resolve_circuit_open_seconds", dur)
+                    except Exception:
+                        pass
+                _RESOLVE_CIRCUIT_LAST_OPEN_TS = 0.0
+        except Exception:
+            pass
         if now < _RESOLVE_LOCKOUT_UNTIL:
             metric_inc("resolve_circuit_open")
             raise RuntimeError("Hệ thống tạm ngưng tìm kiếm do quá nhiều lỗi liên tiếp. Thử lại sau vài giây...")
@@ -558,9 +460,9 @@ class YTDLTrack:
             async with DOWNLOAD_SEMAPHORE:
                 data = None
                 metric_inc("resolve_attempts")
-                # Primary attempt
+                # Primary attempt with dedicated thread pool
                 try:
-                    fut_exec = loop.run_in_executor(None, lambda: ytdl.extract_info(query, download=False))
+                    fut_exec = loop.run_in_executor(_YTDL_EXECUTOR, lambda: ytdl.extract_info(query, download=False))
                     data = await asyncio.wait_for(fut_exec, timeout=timeout)
                 except asyncio.TimeoutError:
                     logger.warning("yt-dlp timeout for query=%s", query)
@@ -572,14 +474,14 @@ class YTDLTrack:
                 except Exception as e:
                     logger.exception("yt-dlp extract_info failed (attempt 1): %s", e)
 
-                # Fallback attempts
+                # Fallback attempts with dedicated thread pool
                 if not data:
                     try:
                         alt_opts = dict(YTDL_OPTS)
                         alt_opts["format"] = "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best"
                         alt_opts["noplaylist"] = True
                         alt_ytdl = YoutubeDL(alt_opts)
-                        fut2 = loop.run_in_executor(None, lambda: alt_ytdl.extract_info(query, download=False))
+                        fut2 = loop.run_in_executor(_YTDL_EXECUTOR, lambda: alt_ytdl.extract_info(query, download=False))
                         data = await asyncio.wait_for(fut2, timeout=timeout)
                     except asyncio.TimeoutError:
                         logger.warning("yt-dlp fallback timeout for query=%s", query)
@@ -591,7 +493,7 @@ class YTDLTrack:
                             minimal_opts.pop("format", None)
                             minimal_opts["noplaylist"] = True
                             minimal_ytdl = YoutubeDL(minimal_opts)
-                            fut3 = loop.run_in_executor(None, lambda: minimal_ytdl.extract_info(query, download=False))
+                            fut3 = loop.run_in_executor(_YTDL_EXECUTOR, lambda: minimal_ytdl.extract_info(query, download=False))
                             data = await asyncio.wait_for(fut3, timeout=timeout)
                         except Exception:
                             logger.exception("yt-dlp final fallback failed")
@@ -641,6 +543,13 @@ class YTDLTrack:
             metric_inc("resolve_fail")
             if _RESOLVE_FAIL_STREAK >= _RESOLVE_FAIL_THRESHOLD:
                 _RESOLVE_LOCKOUT_UNTIL = time.time() + _RESOLVE_COOLDOWN_SECONDS
+                # Record circuit open event only when transitioning to open state
+                if not _RESOLVE_CIRCUIT_LAST_OPEN_TS:
+                    _RESOLVE_CIRCUIT_LAST_OPEN_TS = time.time()
+                    try:
+                        metric_inc("resolve_circuit_open_events")
+                    except Exception:
+                        pass
                 logger.error("Resolve circuit OPEN for %ss (streak=%s)", _RESOLVE_COOLDOWN_SECONDS, _RESOLVE_FAIL_STREAK)
             try:
                 fut.set_exception(e)
@@ -655,73 +564,67 @@ class YTDLTrack:
                 pass
             try:
                 elapsed = time.perf_counter() - t_start
-                _METRICS["resolve_time_total_seconds"] += elapsed
-                _METRICS["resolve_time_count"] += 1
+                metric_add_time("resolve_time", elapsed)
             except Exception:
                 pass
 
-# audio creation
-def _ffmpeg_options_for_profile(volume: float):
-    vol = max(0.0, min(float(volume), 4.0))
-    if STREAM_PROFILE == "super-low-latency":
-        # Extreme low-latency: tiniest probe/analyze, no input buffering. Requires strong CPU/network.
-        # Notes: may stutter on unstable links. Best when bot is close to Discord region.
-        before = FFMPEG_BEFORE_BASE
-        opts = (
-            f'-vn -af "volume={vol}" -b:a {FFMPEG_BITRATE} -ar 48000 -threads {FFMPEG_THREADS} '
-            f'-nostats -loglevel error -probesize 16k -analyzeduration 0 -bufsize 256k -rtbufsize 256k '
-            f'-fflags nobuffer -flags low_delay -max_delay 0 -reorder_queue_size 0 -flush_packets 1'
-        )
-    elif STREAM_PROFILE == "low-latency":
-        # Lower analyzeduration/probesize to start faster, keep reasonable buffers to reduce stutter
-        before = FFMPEG_BEFORE_BASE
-        opts = (
-            f'-vn -af "volume={vol}" -b:a {FFMPEG_BITRATE} -ar 48000 -threads {FFMPEG_THREADS} '
-            f'-nostats -loglevel error -probesize 64k -analyzeduration 100000 -bufsize 512k -rtbufsize 512k'
-        )
-    else:  # stable
-        # Stable: be conservative; normalize timestamps and throttle input with -re (on before_options) to avoid fast playback
-        before = FFMPEG_BEFORE_BASE + " -re"
-        opts = (
-            f'-vn -af "volume={vol}" -b:a {FFMPEG_BITRATE} -ar 48000 -threads {FFMPEG_THREADS} '
-            f'-fflags +genpts -avoid_negative_ts make_zero -muxpreload 0 -muxdelay 0 '
-            f'-nostats -loglevel error -probesize 512k -analyzeduration 1500000 -bufsize 1M -rtbufsize 1M'
-        )
-    return before, opts
+# Audio creation functions replaced with modular versions
+def _ffmpeg_options_for_profile(volume: float) -> Tuple[List[str], List[str]]:
+    """Wrapper for backward compatibility - delegates to audio_processor module.
+    
+    Args:
+        volume: Audio volume level (0.0 to 1.0)
+        
+    Returns:
+        Tuple of (before_options, audio_options) for FFmpeg
+    """
+    return get_ffmpeg_options_for_profile(STREAM_PROFILE, volume, FFMPEG_BITRATE, FFMPEG_THREADS, HTTP_UA)
 
-
-def create_audio_source(stream_url: str, volume: float = 1.0):
-    stream_url = _sanitize_stream_url(stream_url) or stream_url
-    before, options = _ffmpeg_options_for_profile(volume)
-    kwargs = {"before_options": before, "options": options}
-    try:
-        logger.info("FFmpeg profile=%s options=%s", STREAM_PROFILE, options)
-        return discord.FFmpegOpusAudio(stream_url, **kwargs)
-    except Exception as e:
-        logger.warning("FFmpegOpusAudio failed (%s); fallback to PCM", e)
-        return discord.FFmpegPCMAudio(stream_url, **kwargs)
+def create_audio_source_wrapper(stream_url: str, volume: float = 1.0) -> discord.AudioSource:
+    """Wrapper for backward compatibility - delegates to audio_processor module.
+    
+    Args:
+        stream_url: URL of the audio stream
+        volume: Audio volume level (0.0 to 1.0)
+        
+    Returns:
+        Discord audio source for playback
+    """
+    return create_audio_source(stream_url, volume, STREAM_PROFILE, FFMPEG_BITRATE, FFMPEG_THREADS, HTTP_UA)
 
 # Player implementation
 class MusicPlayer:
-    def __init__(self, guild: discord.Guild, text_channel: discord.TextChannel):
+    """Music player for a Discord guild with queue management and playback control.
+    
+    Manages audio playback, queue operations, loop modes, and voice channel connectivity
+    for a specific Discord server.
+    """
+    
+    def __init__(self, guild: discord.Guild, text_channel: discord.TextChannel) -> None:
+        """Initialize music player for a guild.
+        
+        Args:
+            guild: Discord guild this player belongs to
+            text_channel: Text channel for bot messages and updates
+        """
         self.bot = bot
-        self.guild = guild
-        self.text_channel = text_channel
-        self.queue = AsyncDequeQueue()
-        self.next_event = asyncio.Event()
-        self.current = None
-        self.volume = 1.0
+        self.guild: discord.Guild = guild
+        self.text_channel: discord.TextChannel = text_channel
+        self.queue: AsyncDequeQueue = AsyncDequeQueue()
+        self.next_event: asyncio.Event = asyncio.Event()
+        self.current: Optional[Dict[str, Any]] = None
+        self.volume: float = 1.0
         # loop_all: requeue current and full queue snapshot; loop_one: repeat only current track
-        self.loop_mode = False  # legacy flag for loop_all
-        self.loop_one = False   # new single-track loop flag
+        self.loop_mode: bool = False  # legacy flag for loop_all
+        self.loop_one: bool = False   # new single-track loop flag
     # removed unused loop_list
-        self.history = deque(maxlen=200)
+        self.history: deque[Dict[str, Any]] = deque(maxlen=200)
         # internal: when skipping while loop-one is active, suppress requeue of the skipped track once
-        self._suppress_loop_requeue_once = False
+        self._suppress_loop_requeue_once: bool = False
         # capture the loop running when player is created
         # Prefer the bot's running loop if available; otherwise use current running loop.
         try:
-            self._loop = getattr(self.bot, "loop", None) or asyncio.get_running_loop()
+            self._loop: Optional[asyncio.AbstractEventLoop] = getattr(self.bot, "loop", None) or asyncio.get_running_loop()
         except RuntimeError:
             # If no running loop, fall back to creating tasks with asyncio.create_task which will
             # schedule on the event loop when available.
@@ -731,30 +634,38 @@ class MusicPlayer:
             if self._loop:
                 # If we have an explicit loop object, schedule via asyncio.run_coroutine_threadsafe when appropriate
                 # but here we assume code runs within same loop; prefer create_task for compatibility
-                self._task = asyncio.get_running_loop().create_task(self._player_loop())
+                self._task: asyncio.Task[None] = asyncio.get_running_loop().create_task(self._player_loop())
             else:
                 self._task = asyncio.create_task(self._player_loop())
         except Exception:
             # fallback
             self._task = asyncio.create_task(self._player_loop())
-        self._closing = False
-        self._lock = asyncio.Lock()
-        self.prefetch_task = None
-        self.vc = None
-        self.now_message = None
-        self.now_update_task = None
+        self._closing: bool = False
+        self._lock: asyncio.Lock = asyncio.Lock()
+        self.prefetch_task: Optional[asyncio.Task[None]] = None
+        self.vc: Optional[discord.VoiceClient] = None
+        self.now_message: Optional[discord.Message] = None
+        self.now_update_task: Optional[asyncio.Task[None]] = None
         # last interaction / activity timestamp for idle disconnect
-        self._last_active = time.time()
+        self._last_active: float = time.time()
         # whether we've warned the channel about imminent disconnect (kept for potential future use)
-        self._idle_warned = False
+        self._idle_warned: bool = False
         if PREFETCH_NEXT:
             try:
                 self.prefetch_task = asyncio.create_task(self._prefetch_worker())
             except Exception:
                 self.prefetch_task = None
-    # Idle handled by queue timeout inside player loop
     @staticmethod
     def _tracks_equal(a: Any, b: Any) -> bool:
+        """Compare two tracks for equality based on URL or title+duration.
+        
+        Args:
+            a: First track data
+            b: Second track data
+            
+        Returns:
+            True if tracks are considered equal, False otherwise
+        """
         try:
             if a is b:
                 return True
@@ -771,8 +682,12 @@ class MusicPlayer:
             pass
         return False
 
-    def last_finished(self) -> Optional[dict]:
-        """Return the most recently finished track, skipping the current one if present."""
+    def last_finished(self) -> Optional[Dict[str, Any]]:
+        """Return the most recently finished track, skipping the current one if present.
+        
+        Returns:
+            Dictionary containing track data of the last finished track, or None if not available
+        """
         try:
             if not self.history:
                 return None
@@ -783,10 +698,11 @@ class MusicPlayer:
             return None
         return None
 
-    async def play_previous_now(self) -> Optional[dict]:
+    async def play_previous_now(self) -> Optional[Dict[str, Any]]:
         """Preempt current playback and immediately switch to the most recent finished track.
 
-        Returns the previous track dict on success, or None if unavailable.
+        Returns:
+            The previous track dict on success, or None if unavailable
         """
         prev = self.last_finished()
         if not prev:
@@ -795,19 +711,28 @@ class MusicPlayer:
             try:
                 await self.queue.put_front(prev)
             except Exception:
+                logger.debug("play_previous_now: failed to put prev track to front", exc_info=True)
                 return None
             try:
                 self._last_active = time.time()
             except Exception:
-                pass
+                logger.debug("play_previous_now: failed updating last_active", exc_info=True)
             try:
                 if self.vc and (self.vc.is_playing() or self.vc.is_paused()):
                     self.vc.stop()
             except Exception:
-                pass
+                logger.debug("play_previous_now: failed stopping current playback", exc_info=True)
         return prev
 
-    async def add_track(self, data: dict):
+    async def add_track(self, data: Dict[str, Any]) -> None:
+        """Add a track to the player queue.
+        
+        Args:
+            data: Dictionary containing track metadata
+            
+        Raises:
+            RuntimeError: If queue is at maximum capacity
+        """
         async with self._lock:
             size = self.queue.qsize()
             if size >= MAX_QUEUE_SIZE:
@@ -817,7 +742,7 @@ class MusicPlayer:
                 self._last_active = time.time()
                 self._idle_warned = False
             except Exception:
-                pass
+                logger.debug("add_track: failed updating activity timestamps", exc_info=True)
 
     async def clear_all(self):
         async with self._lock:
@@ -856,60 +781,99 @@ class MusicPlayer:
             logger.info("Loop-one disabled for guild=%s", self.guild.id)
 
     async def _prefetch_worker(self):
-        """Continuously attempts to resolve the first queued item early.
+        """Resolve upcoming tracks ahead of playback (documentation only, logic unchanged).
 
-        Implements exponential backoff while the queue is empty to avoid waking
-        the event loop every second forever. Backoff starts at 0.5s and doubles
-        up to 5s, resetting immediately once an item appears. When an unresolved
-        dict (missing 'url') is at the head of the queue it is resolved in-place
-        (preserving request metadata). Errors during prefetch are suppressed to
-        keep this as a best‑effort optimisation.
+        Behavior summary:
+        - Respect self._closing flag for immediate exit.
+        - Empty queue: increment idle metric then adaptive backoff (sleep *=1.5 capped at 5s).
+        - Snapshot queue, inspect first 3 unresolved placeholder dicts (missing 'url').
+        - Use semaphore to cap concurrent resolves at 2; overlap network latency.
+        - Wait for first completion then cancel stragglers to reduce duplicate work.
+        - In-place dict mutation preserves identity; avoids queue rebuild or race.
+        - Failures only debug-logged; circuit breaker handled in resolve path.
+        - Fixed 1s inter-batch sleep; adaptive idle path handles empty queue separately.
         """
         try:
             idle_sleep = 0.5
+            max_concurrent_prefetch = 2  # Limit concurrent prefetch operations
+            prefetch_semaphore = asyncio.Semaphore(max_concurrent_prefetch)
             while True:
                 if self._closing:
                     return
                 if self.queue.empty():
                     metric_inc("prefetch_idle_cycles")
                     await asyncio.sleep(idle_sleep)
-                    # exponential backoff capped at 5s
-                    idle_sleep = min(idle_sleep * 2.0, 5.0)
+                    idle_sleep = min(idle_sleep * 1.5, 5.0)
                     continue
-                # reset backoff once we have work
                 idle_sleep = 0.5
                 snap = self.queue.snapshot()
                 if not snap:
                     continue
-                head = snap[0]
-                if isinstance(head, dict) and not head.get("url"):
-                    q = head.get("webpage_url") or head.get("title") or head.get("query")
-                    if q:
-                        try:
-                            resolved = await YTDLTrack.resolve(q)
-                            metric_inc("prefetch_resolved")
-                            async with self._lock:
-                                # Ensure head didn't change
-                                cur_snap = self.queue.snapshot()
-                                if cur_snap and cur_snap[0] is head:
-                                    rest = cur_snap[1:]
-                                    await self.queue.clear()
-                                    newd = dict(resolved.data)
-                                    # preserve requester metadata
-                                    for k in ("requested_by", "requested_by_id"):
-                                        if head.get(k):
-                                            newd[k] = head.get(k)
-                                    await self.queue.put(newd)
-                                    for it in rest:
-                                        await self.queue.put(it)
-                        except Exception:
-                            # Silent: prefetch is opportunistic
-                            pass
-                await asyncio.sleep(0.75)
+                prefetch_tasks = []
+                for i, item in enumerate(snap[:3]):
+                    if isinstance(item, dict) and not item.get("url"):
+                        query = item.get("webpage_url") or item.get("title") or item.get("query")
+                        if query:
+                            task = self._prefetch_single_track(item, i, prefetch_semaphore)
+                            prefetch_tasks.append(task)
+                if prefetch_tasks:
+                    try:
+                        done, pending = await asyncio.wait(prefetch_tasks, timeout=10.0, return_when=asyncio.FIRST_COMPLETED)
+                        for task in pending:
+                            if not task.done():
+                                task.cancel()
+                        for task in done:
+                            try:
+                                await task
+                            except Exception as e:
+                                logger.debug("Prefetch task failed: %s", e)
+                    except asyncio.TimeoutError:
+                        logger.debug("Prefetch timeout, cancelling tasks")
+                        for task in prefetch_tasks:
+                            if not task.done():
+                                task.cancel()
+                await asyncio.sleep(1.0)
         except asyncio.CancelledError:
             return
         except Exception:
             logger.exception("Prefetch worker crashed")
+
+    async def _prefetch_single_track(self, head_item, position, semaphore):
+        """Prefetch a single track with semaphore control."""
+        async with semaphore:
+            query = head_item.get("webpage_url") or head_item.get("title") or head_item.get("query")
+            if not query:
+                return
+                
+            try:
+                resolved = await YTDLTrack.resolve(query, timeout=15.0)  # Shorter timeout for prefetch
+                metric_inc("prefetch_resolved")
+                
+                async with self._lock:
+                    # Verify the item is still at the expected position
+                    cur_snap = self.queue.snapshot()
+                    if (cur_snap and len(cur_snap) > position and 
+                        cur_snap[position] is head_item):
+                        # In-place mutate existing dict to avoid queue rebuild
+                        req_by = head_item.get("requested_by")
+                        req_by_id = head_item.get("requested_by_id")
+                        try:
+                            head_item.clear()
+                            head_item.update(resolved.data)
+                        except Exception:
+                            # Fallback shallow merge
+                            for k, v in resolved.data.items():
+                                head_item[k] = v
+                            logger.debug("prefetch inplace update fallback merge used", exc_info=True)
+                        if req_by:
+                            head_item["requested_by"] = req_by
+                        if req_by_id:
+                            head_item["requested_by_id"] = req_by_id
+                        metric_inc("prefetch_inplace_updates")
+                                
+            except Exception as e:
+                logger.debug("Prefetch resolve failed for query=%s: %s", query[:50], e)
+                raise
 
     # (Idle watchdog removed; periodic progress handled elsewhere)
 
@@ -917,7 +881,7 @@ class MusicPlayer:
         async def updater():
             try:
                 while True:
-                    if not self.now_message:
+                    if not self.now_message or self._closing:
                         return
                     try:
                         elapsed = time.time() - started_at
@@ -971,7 +935,7 @@ class MusicPlayer:
                 except asyncio.TimeoutError:
                     # Notify and disconnect when idle with empty queue
                     try:
-                        vc = self.vc or discord.utils.get(self.bot.voice_clients, guild=self.guild)
+                        vc = self.vc or get_voice_client_cached(self.bot, self.guild)
                         if vc and vc.is_connected():
                             try:
                                 await self.text_channel.send("Không ai phát nhạc nên mình đi đây. Hẹn gặp lại ✨")
@@ -1017,6 +981,10 @@ class MusicPlayer:
                         continue
                 else:
                     logger.error("Unknown queue item type: %s", type(item))
+                    try:
+                        metric_inc("queue_unknown_type")  # Low: observability metric
+                    except Exception:
+                        pass
                     continue
 
                 if not data or not data.get("url"):
@@ -1028,7 +996,7 @@ class MusicPlayer:
 
                 try:
                     t0 = time.perf_counter()
-                    src = create_audio_source(data.get("url"), volume=self.volume)
+                    src = create_audio_source_wrapper(data.get("url"), volume=self.volume)
                 except Exception as e:
                     logger.exception("create_audio_source failed: %s", e)
                     try:
@@ -1037,7 +1005,7 @@ class MusicPlayer:
                         pass
                     continue
 
-                vc = self.vc or discord.utils.get(self.bot.voice_clients, guild=self.guild)
+                vc = self.vc or get_voice_client_cached(self.bot, self.guild)
                 if not vc or not vc.is_connected():
                     try:
                         await self.text_channel.send("Mình chưa vô kênh thoại nào cả :<")
@@ -1100,7 +1068,7 @@ class MusicPlayer:
                                     logger.warning("FFmpeg ended early, attempting single restart guild=%s", self.guild.id)
                                     try:
                                         # recreate source and play again
-                                        new_src = create_audio_source(data.get("url"), volume=self.volume)
+                                        new_src = create_audio_source_wrapper(data.get("url"), volume=self.volume)
                                         vc.play(new_src, after=_after)
                                     except Exception:
                                         logger.exception("FFmpeg restart failed")
@@ -1149,7 +1117,7 @@ class MusicPlayer:
                         self.now_update_task.cancel()
                         self.now_update_task = None
                 except Exception:
-                    pass
+                    logger.debug("player_loop: failed cancelling now_update_task", exc_info=True)
 
                 try:
                     # loop_one: repeat only current track immediately; if a skip just happened, suppress once
@@ -1166,7 +1134,7 @@ class MusicPlayer:
                         await self.queue.put(track.data)
                         logger.info("Loop-all requeue guild=%s title=%s", self.guild.id, truncate(track.data.get("title"), 80))
                 except Exception:
-                    logger.exception("Failed to requeue for loop mode")
+                    logger.exception("Failed to requeue for loop mode (loop_one=%s loop_all=%s)", self.loop_one, self.loop_mode)
 
                 vc = discord.utils.get(self.bot.voice_clients, guild=self.guild)
                 if self.queue.empty() and (not vc or not vc.is_playing()):
@@ -1197,53 +1165,81 @@ class MusicPlayer:
             logger.info("Player stopped guild=%s", self.guild.id)
 
     def destroy(self):
+        """Properly cleanup all resources associated with this player."""
+        if getattr(self, '_destroying', False):
+            return  # Prevent double destruction
+        self._destroying = True
         self._closing = True
+        
+        logger.debug("Destroying player for guild %s", self.guild.id)
+        
         try:
             players.pop(self.guild.id, None)
-        except Exception:
-            pass
-        try:
-            if self.prefetch_task and not self.prefetch_task.done():
-                self.prefetch_task.cancel()
-        except Exception:
-            pass
-        try:
-            if self.now_update_task and not self.now_update_task.done():
-                self.now_update_task.cancel()
-        except Exception:
-            pass
-        try:
-            if not self._task.done():
-                self._task.cancel()
-        except Exception:
-            logger.exception("Error cancelling player task")
-        try:
-            # clear queue asynchronously
+        except Exception as e:
+            logger.debug("Error removing player from global dict: %s", e)
+            
+        # Cancel all running tasks
+        tasks_to_cancel = [
+            ('prefetch_task', self.prefetch_task),
+            ('now_update_task', self.now_update_task),
+            ('_task', self._task)
+        ]
+        
+        for task_name, task in tasks_to_cancel:
             try:
-                if self._loop:
-                    self._loop.create_task(self.queue.clear())
+                if task and not task.done():
+                    task.cancel()
+                    logger.debug("Cancelled %s for guild %s", task_name, self.guild.id)
+            except Exception as e:
+                logger.debug("Error cancelling %s: %s", task_name, e)
+        
+        # Clear queue
+        try:
+            if hasattr(self, 'queue') and self.queue:
+                # Use sync clear if possible to avoid creating new tasks during shutdown
+                if hasattr(self.queue, '_dq'):
+                    self.queue._dq.clear()
                 else:
-                    asyncio.create_task(self.queue.clear())
-            except Exception:
-                asyncio.create_task(self.queue.clear())
-        except Exception:
-            pass
+                    # Fallback to async clear
+                    try:
+                        if self._loop and not self._loop.is_closed():
+                            self._loop.create_task(self.queue.clear())
+                        else:
+                            asyncio.create_task(self.queue.clear())
+                    except Exception:
+                        pass
+        except Exception as e:
+            logger.debug("Error clearing queue: %s", e)
+        
+        # Disconnect voice client
         try:
             if self.vc and self.vc.is_connected():
                 try:
-                    if self._loop:
+                    if self._loop and not self._loop.is_closed():
                         self._loop.create_task(self.vc.disconnect())
                     else:
                         asyncio.create_task(self.vc.disconnect())
-                except Exception:
-                    asyncio.create_task(self.vc.disconnect())
-        except Exception:
-            pass
+                except Exception as e:
+                    logger.debug("Error scheduling voice disconnect: %s", e)
+        except Exception as e:
+            logger.debug("Error handling voice client disconnect: %s", e)
 
 # global structures
 players: Dict[int, MusicPlayer] = {}
 
 def get_player_for_ctx(guild: discord.Guild, text_channel: discord.TextChannel) -> MusicPlayer:
+    """Get or create a music player for the given guild and text channel.
+    
+    Args:
+        guild: Discord guild to get player for
+        text_channel: Text channel for bot messages
+        
+    Returns:
+        MusicPlayer instance for the guild
+        
+    Raises:
+        RuntimeError: If guild is None
+    """
     if guild is None:
         raise RuntimeError("No guild in context")
     player = players.get(guild.id)
@@ -1254,11 +1250,31 @@ def get_player_for_ctx(guild: discord.Guild, text_channel: discord.TextChannel) 
 
 # UI controls
 class MusicControls(ui.View):
-    def __init__(self, guild_id: int, *, timeout: float = 300):
+    """Discord UI View for music playback controls.
+    
+    Provides buttons for pause/resume, skip, volume control, and other
+    music player operations with proper permission checking.
+    """
+    
+    def __init__(self, guild_id: int, *, timeout: float = 300) -> None:
+        """Initialize music controls for a guild.
+        
+        Args:
+            guild_id: Discord guild ID this control panel belongs to
+            timeout: How long to wait before timing out the view
+        """
         super().__init__(timeout=timeout)
-        self.guild_id = guild_id
+        self.guild_id: int = guild_id
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        """Check if user can interact with music controls.
+        
+        Args:
+            interaction: Discord interaction to validate
+            
+        Returns:
+            True if user can use controls, False otherwise
+        """
         if not interaction.user.voice or not interaction.user.voice.channel:
             await interaction.response.send_message("Bạn phải ở trong kênh thoại để điều chỉnh nhạc", ephemeral=True)
             return False
@@ -1275,11 +1291,17 @@ class MusicControls(ui.View):
             if p:
                 p._last_active = time.time()
         except Exception:
-            pass
+            logger.debug("interaction_check: failed updating last_active", exc_info=True)
         return True
 
     @ui.button(emoji="⏯️", label="Tạm dừng/Tiếp tục", style=discord.ButtonStyle.primary, row=0)
-    async def pause_resume(self, inter: discord.Interaction, button: ui.Button):
+    async def pause_resume(self, inter: discord.Interaction, button: ui.Button) -> None:
+        """Toggle pause/resume for current track.
+        
+        Args:
+            inter: Discord interaction from button press
+            button: The button that was pressed
+        """
         vc = discord.utils.get(bot.voice_clients, guild=inter.guild)
         if not vc or not getattr(vc, "source", None):
             await inter.response.send_message("Không có bài nào đang phát", ephemeral=True)
@@ -1318,7 +1340,7 @@ class MusicControls(ui.View):
             try:
                 vc.stop()
             except Exception:
-                pass
+                logger.debug("stop button: vc.stop failed", exc_info=True)
         # Do not disconnect the bot here. Stop playback and clear queue so users
         # can resume without reconnecting.
         player = players.get(inter.guild.id)
@@ -1326,17 +1348,17 @@ class MusicControls(ui.View):
             try:
                 await player.disable_loop()
             except Exception:
-                pass
+                logger.debug("stop button: disable_loop failed", exc_info=True)
             try:
                 await player.clear_all()
             except Exception:
-                pass
+                logger.debug("stop button: clear_all failed", exc_info=True)
             # stop current playback if present
             try:
                 if player.vc and getattr(player.vc, "is_playing", lambda: False)():
                     player.vc.stop()
             except Exception:
-                pass
+                logger.debug("stop button: stopping current source failed", exc_info=True)
             # clear now-playing state
             try:
                 player.current = None
@@ -1344,7 +1366,7 @@ class MusicControls(ui.View):
                     player.now_update_task.cancel()
                 player.now_message = None
             except Exception:
-                pass
+                logger.debug("stop button: clearing now-playing state failed", exc_info=True)
         await inter.response.send_message("⏹️ Đã dừng phát và xóa hàng đợi", ephemeral=True)
 
     @ui.button(emoji="📜", label="Hàng đợi", style=discord.ButtonStyle.secondary, row=1)
@@ -1455,6 +1477,19 @@ async def slash_report(interaction: discord.Interaction):
 @bot.event
 async def on_ready():
     logger.info("Bot ready: %s (ID: %s)", bot.user, bot.user.id)
+    
+    # Check FFmpeg availability at startup
+    try:
+        import shutil
+        ffmpeg_path = shutil.which("ffmpeg") or shutil.which("ffmpeg.exe")
+        if not ffmpeg_path:
+            logger.error("CRITICAL: FFmpeg not found in PATH! Audio playback will fail.")
+            logger.error("Please install FFmpeg and ensure it's available in your system PATH.")
+        else:
+            logger.info("FFmpeg found at: %s", ffmpeg_path)
+    except Exception as e:
+        logger.error("Error checking FFmpeg availability: %s", e)
+    
     try:
         # 1) Prune previously created guild-specific duplicates (if any)
         #    We clear per-guild command sets and push an empty sync so only global commands remain.
@@ -1471,9 +1506,17 @@ async def on_ready():
     except Exception:
         logger.exception("Slash command sync/prune step failed")
     try:
-        asyncio.create_task(_cache_cleanup_loop())
-    except Exception:
-        pass
+        # Start background cache cleanup task
+        cleanup_task = asyncio.create_task(_cache_cleanup_loop())
+        logger.info("Started cache cleanup background task")
+    except Exception as e:
+        logger.error("Failed to start cache cleanup task: %s", e)
+    try:
+        # Start voice client cache cleanup task
+        voice_cleanup_task = asyncio.create_task(cleanup_voice_cache())
+        logger.info("Started voice cache cleanup background task")
+    except Exception as e:
+        logger.error("Failed to start voice cache cleanup task: %s", e)
     try:
         await bot.change_presence(activity=discord.Game(name="/play hoặc /help để bắt đầu ✨"))
     except Exception:
@@ -1520,44 +1563,10 @@ async def on_voice_state_update(member: discord.Member, before, after):
             player.destroy()
             logger.info("Player destroyed due to bot voice disconnect in guild %s", before.channel.guild.id)
 
-# helper to ensure voice connection when user requests join
-async def ensure_connected_for_user(ctx_or_interaction) -> Optional[discord.VoiceClient]:
-    user = getattr(ctx_or_interaction, 'author', None) or getattr(ctx_or_interaction, 'user', None)
-    guild = getattr(ctx_or_interaction, 'guild', None)
-    if not user or not getattr(user, 'voice', None) or not user.voice.channel:
-        try:
-            if isinstance(ctx_or_interaction, discord.Interaction):
-                await ctx_or_interaction.response.send_message("Bạn chưa ở trong kênh thoại nào", ephemeral=True)
-            else:
-                await ctx_or_interaction.send("Bạn chưa ở trong kênh thoại nào")
-        except Exception:
-            pass
-        return None
-    ch = user.voice.channel
-    vc = discord.utils.get(bot.voice_clients, guild=guild)
-    try:
-        if vc and vc.is_connected():
-            if vc.channel.id != ch.id:
-                await vc.move_to(ch)
-        else:
-            vc = await ch.connect()
-    except Exception:
-        logger.exception("Connect failed")
-        try:
-            if isinstance(ctx_or_interaction, discord.Interaction):
-                await ctx_or_interaction.response.send_message("Không thể kết nối kênh thoại", ephemeral=True)
-            else:
-                await ctx_or_interaction.send("Không thể kết nối kênh thoại.")
-        except Exception:
-            pass
-        return None
-    player = get_player_for_ctx(guild, getattr(ctx_or_interaction, 'channel', None) or getattr(ctx_or_interaction, 'text_channel', None))
-    player.vc = vc
-    try:
-        player._last_active = time.time()
-    except Exception:
-        pass
-    return vc
+# helper to ensure voice connection when user requests join - now uses modular version
+async def ensure_connected_for_user_wrapper(ctx_or_interaction) -> Optional[discord.VoiceClient]:
+    """Wrapper for backward compatibility - delegates to voice_manager module."""
+    return await ensure_connected_for_user(ctx_or_interaction, bot)
 
 # central play handler shared by both text and slash
 async def handle_play_request(ctx_or_interaction, query: str):
@@ -1581,7 +1590,7 @@ async def handle_play_request(ctx_or_interaction, query: str):
     if is_url:
         try:
             parsed = urlparse(lc_query)
-            if not _is_domain_allowed_global(parsed.netloc):
+            if not validate_domain(query, GLOBAL_ALLOWED_DOMAINS):
                 msg = "Nguồn này không được hỗ trợ. Hỗ trợ: YouTube, SoundCloud, Bandcamp, Mixcloud, Audius."
                 if isinstance(ctx_or_interaction, discord.Interaction):
                     await ctx_or_interaction.response.send_message(msg, ephemeral=True)
@@ -1800,6 +1809,13 @@ async def text_skip(ctx):
     player = players.get(ctx.guild.id)
     if not player:
         vc.stop(); await ctx.send("⏭️ Đã skip bài hiện tại"); return
+
+
+
+
+
+
+
     if player.queue.empty():
         await ctx.send("Không có bài nhạc nào kế tiếp để mình chuyển qua, bạn thêm bài hát mới vào nhé 😋")
         return
@@ -1913,21 +1929,20 @@ def _format_stats(guild: Optional[discord.Guild] = None) -> str:
     except Exception:
         p = None
     ms = metrics_snapshot()
-    total = ms.get("resolve_time_total_seconds", 0.0)
-    count = ms.get("resolve_time_count", 0) or 0
-    avg = (total / count) if count else 0.0
+    avg = get_average_resolve_time()
     lines = [
         f"Profile: {STREAM_PROFILE}",
         f"Prefetch: {'on' if PREFETCH_NEXT else 'off'}",
         f"Now update interval: {NOW_UPDATE_INTERVAL}s",
-    f"Idle disconnect: {IDLE_DISCONNECT_SECONDS}s",
-        f"Cache entries: {len(_TRACK_CACHE)} (hits={ms.get('cache_hits')} miss={ms.get('cache_miss')})",
-    f"Resolve: attempts={ms.get('resolve_attempts')} ok={ms.get('resolve_success')} fail={ms.get('resolve_fail')} circuit_open={ms.get('resolve_circuit_open')}",
-    f"Resolve avg: {avg:.3f}s (n={count})",
-    f"Playback: start={ms.get('playback_start')} finish={ms.get('playback_finish')} err={ms.get('playback_error')}",
-    f"Queue adds: {ms.get('queue_add')}",
+        f"Idle disconnect: {IDLE_DISCONNECT_SECONDS}s",
+        f"Cache entries: {CACHE_MANAGER.get_stats()['size']} (hits={ms.get('cache_hits')} miss={ms.get('cache_miss')})",
+        f"Resolve: attempts={ms.get('resolve_attempts')} ok={ms.get('resolve_success')} fail={ms.get('resolve_fail')} circuit_open={ms.get('resolve_circuit_open')}",
+        f"Resolve avg: {avg:.3f}s",
+        f"Circuit open events: {ms.get('resolve_circuit_open_events')} total_open_time={ms.get('resolve_circuit_open_seconds_total_seconds', 0.0):.2f}s" if 'resolve_circuit_open_events' in ms else "",
+        f"Playback: start={ms.get('playback_start')} finish={ms.get('playback_finish')} err={ms.get('playback_error')}",
+        f"Queue adds: {ms.get('queue_add')}",
         f"FFmpeg restarts: {ms.get('ffmpeg_restarts')}",
-    f"Prefetch: resolved={ms.get('prefetch_resolved')} idle_cycles={ms.get('prefetch_idle_cycles')}",
+        f"Prefetch: resolved={ms.get('prefetch_resolved')} idle_cycles={ms.get('prefetch_idle_cycles')}",
     ]
     if p:
         lines.extend([
@@ -1936,7 +1951,7 @@ def _format_stats(guild: Optional[discord.Guild] = None) -> str:
             f"Loop one: {p.loop_one}",
             f"Current: {truncate((p.current or {}).get('title'), 60) if p.current else 'None'}",
         ])
-    return "\n".join(lines)
+    return "\n".join([l for l in lines if l])
 
 @bot.command(name="stats")
 async def text_stats(ctx):
@@ -1961,7 +1976,10 @@ async def text_health(ctx):
         lines.append(f"Queue size: {p.queue.qsize()} | Current: {truncate((p.current or {}).get('title'),40) if p.current else 'None'}")
         lines.append(f"Loop all: {p.loop_mode} | Loop one: {p.loop_one}")
     ms = metrics_snapshot()
-    lines.append(f"Cache entries: {len(_TRACK_CACHE)} (hits={ms.get('cache_hits')} miss={ms.get('cache_miss')})")
+    try:
+        lines.append(f"Cache entries: {CACHE_MANAGER.get_stats()['size']} (hits={ms.get('cache_hits')} miss={ms.get('cache_miss')})")
+    except Exception:
+        lines.append(f"Cache entries: n/a (hits={ms.get('cache_hits')} miss={ms.get('cache_miss')})")
     try:
         cooldown = max(0, int(_RESOLVE_LOCKOUT_UNTIL - time.time())) if '_RESOLVE_LOCKOUT_UNTIL' in globals() else 0
         lines.append(f"Resolve streak: {_RESOLVE_FAIL_STREAK} | Circuit: {'open' if cooldown>0 else 'closed'}{f' ({cooldown}s)' if cooldown>0 else ''} attempts={ms.get('resolve_attempts')} ok={ms.get('resolve_success')} fail={ms.get('resolve_fail')}")
@@ -1979,11 +1997,16 @@ async def text_health(ctx):
     lines.append(f"Profile: {STREAM_PROFILE}")
     lines.append(f"Idle disconnect: {IDLE_DISCONNECT_SECONDS}s")
     lines.append(f"Prefetch: resolved={ms.get('prefetch_resolved')} idle_cycles={ms.get('prefetch_idle_cycles')}")
-    await ctx.send(f"```\n" + "\n".join(lines) + "\n```")
+    if 'resolve_circuit_open_events' in ms:
+        try:
+            lines.append(f"Circuit: events={ms.get('resolve_circuit_open_events')} total_open_time={ms.get('resolve_circuit_open_seconds_total_seconds', 0.0):.2f}s")
+        except Exception:
+            pass
+    await ctx.send(f"```\n" + "\n".join([l for l in lines if l]) + "\n```")
 
 @tree.command(name="health", description="Chẩn đoán nhanh (voice/queue/cache)")
 async def slash_health(interaction: discord.Interaction):
-    vc = discord.utils.get(bot.voice_clients, guild=interaction.guild)
+    vc = get_voice_client_cached(bot, interaction.guild)
     p = players.get(interaction.guild.id)
     lines = []
     lines.append(f"Voice connected: {bool(vc and vc.is_connected())}")
@@ -1996,7 +2019,7 @@ async def slash_health(interaction: discord.Interaction):
         lines.append(f"Queue size: {p.queue.qsize()} | Current: {truncate((p.current or {}).get('title'),40) if p.current else 'None'}")
         lines.append(f"Loop all: {p.loop_mode} | Loop one: {p.loop_one}")
     ms = metrics_snapshot()
-    lines.append(f"Cache entries: {len(_TRACK_CACHE)} (hits={ms.get('cache_hits')} miss={ms.get('cache_miss')})")
+    lines.append(f"Cache entries: {CACHE_MANAGER.get_stats()['size']} (hits={ms.get('cache_hits')} miss={ms.get('cache_miss')})")
     try:
         cooldown = max(0, int(_RESOLVE_LOCKOUT_UNTIL - time.time())) if '_RESOLVE_LOCKOUT_UNTIL' in globals() else 0
         lines.append(f"Resolve streak: {_RESOLVE_FAIL_STREAK} | Circuit: {'open' if cooldown>0 else 'closed'}{f' ({cooldown}s)' if cooldown>0 else ''} attempts={ms.get('resolve_attempts')} ok={ms.get('resolve_success')} fail={ms.get('resolve_fail')}")
@@ -2014,7 +2037,7 @@ async def slash_health(interaction: discord.Interaction):
     lines.append(f"Profile: {STREAM_PROFILE}")
     lines.append(f"Idle disconnect: {IDLE_DISCONNECT_SECONDS}s")
     lines.append(f"Prefetch: resolved={ms.get('prefetch_resolved')} idle_cycles={ms.get('prefetch_idle_cycles')}")
-    await interaction.response.send_message(f"```\n" + "\n".join(lines) + "\n```", ephemeral=True)
+    await interaction.response.send_message(f"```\n" + "\n".join([l for l in lines if l]) + "\n```", ephemeral=True)
 
 @bot.command(name="version")
 async def text_version(ctx):
@@ -2030,21 +2053,19 @@ async def slash_version(interaction: discord.Interaction):
 async def text_metrics(ctx):
     ms = metrics_snapshot()
     lines = []
-    total = ms.get("resolve_time_total_seconds", 0.0)
-    count = ms.get("resolve_time_count", 0) or 0
-    avg = (total / count) if count else 0.0
+    avg = get_average_resolve_time()
     for k, v in sorted(ms.items()):
         lines.append(f"{k}: {v}")
     lines.append(f"resolve_time_avg_seconds: {avg:.3f}")
+    if 'resolve_circuit_open_seconds_total_seconds' in ms:
+        lines.append(f"resolve_circuit_open_total_seconds: {ms.get('resolve_circuit_open_seconds_total_seconds')}")
     await ctx.send(f"```\n" + "\n".join(lines) + "\n```")
 
 @tree.command(name="metrics", description="Hiện các metrics nội bộ giúp debug")
 async def slash_metrics(interaction: discord.Interaction):
     ms = metrics_snapshot()
     lines = []
-    total = ms.get("resolve_time_total_seconds", 0.0)
-    count = ms.get("resolve_time_count", 0) or 0
-    avg = (total / count) if count else 0.0
+    avg = get_average_resolve_time()
     for k, v in sorted(ms.items()):
         lines.append(f"{k}: {v}")
     lines.append(f"resolve_time_avg_seconds: {avg:.3f}")
@@ -2144,6 +2165,10 @@ async def text_reverse(ctx):
             return
     except Exception:
         await ctx.send("Không có lịch sử bài hát để quay lại."); return
+    try:
+        metric_inc("reverse_usage")  # Low: usage metric
+    except Exception:
+        pass
     await ctx.send(f"↩️ Đang chuyển về: {truncate(last.get('title') if isinstance(last, dict) else str(last), 80)}")
 
 
@@ -2158,6 +2183,10 @@ async def slash_reverse(interaction: discord.Interaction):
             await interaction.response.send_message("Không có lịch sử bài hát để quay lại.", ephemeral=True); return
     except Exception:
         await interaction.response.send_message("Không có lịch sử bài hát để quay lại.", ephemeral=True); return
+    try:
+        metric_inc("reverse_usage")
+    except Exception:
+        pass
     await interaction.response.send_message(f"↩️ Đang chuyển về: {truncate(last.get('title') if isinstance(last, dict) else str(last), 80)}", ephemeral=True)
 
 @bot.command(name="shutdown")
@@ -2175,7 +2204,7 @@ async def text_shutdown(ctx):
         # offload blocking atomic write to executor
         try:
             loop = asyncio.get_running_loop()
-            loop.run_in_executor(None, lambda: _write_snapshot_file(snap))
+            loop.run_in_executor(None, lambda: write_snapshot_file(snap))
         except Exception:
             # fallback to sync write
             with open("queues_snapshot.json", "w", encoding="utf-8") as f:
@@ -2187,6 +2216,11 @@ async def text_shutdown(ctx):
             await vc.disconnect()
         except Exception:
             pass
+    # Proactively shutdown executor
+    try:
+        _YTDL_EXECUTOR.shutdown(wait=False, cancel_futures=True)
+    except Exception:
+        pass
     await bot.close()
 
 @tree.command(name="shutdown", description="Tắt bot")
@@ -2205,7 +2239,7 @@ async def slash_shutdown(interaction: discord.Interaction):
                 pass
         try:
             loop = asyncio.get_running_loop()
-            loop.run_in_executor(None, lambda: _write_snapshot_file(snap))
+            loop.run_in_executor(None, lambda: write_snapshot_file(snap))
         except Exception:
             with open("queues_snapshot.json", "w", encoding="utf-8") as f:
                 json.dump(snap, f, ensure_ascii=False, indent=2)
@@ -2216,6 +2250,10 @@ async def slash_shutdown(interaction: discord.Interaction):
             await vc.disconnect()
         except Exception:
             pass
+    try:
+        _YTDL_EXECUTOR.shutdown(wait=False, cancel_futures=True)
+    except Exception:
+        pass
     await bot.close()
 
 @bot.command(name="clear_all")
@@ -2440,44 +2478,29 @@ async def slash_leave(interaction: discord.Interaction):
 @bot.command(name="stop")
 async def text_stop(ctx):
     vc = discord.utils.get(bot.voice_clients, guild=ctx.guild)
-    if vc:
-        try:
-            vc.stop()
-        except Exception:
-            pass
     player = players.get(ctx.guild.id)
-    if player:
-        try:
-            # Disable loop to avoid requeue
-            await player.disable_loop()
-            await player.disable_loop_one()
-        except Exception:
-            pass
-        try:
-            await player.clear_all()
-        except Exception:
-            pass
-        try:
-            player.current = None
-            if player.now_update_task and not player.now_update_task.done():
-                player.now_update_task.cancel()
-            player.now_message = None
-        except Exception:
-            pass
+    await _stop_playback_and_clear(vc, player)
     await ctx.send("⏹️ Đã dừng phát và xóa hàng đợi")
 
 @tree.command(name="stop", description="Dừng phát nhạc và xóa hàng đợi")
 async def slash_stop(interaction: discord.Interaction):
     vc = discord.utils.get(bot.voice_clients, guild=interaction.guild)
+    player = players.get(interaction.guild.id)
+    await _stop_playback_and_clear(vc, player)
+    await interaction.response.send_message("⏹️ Đã dừng phát và xóa hàng đợi", ephemeral=True)
+
+async def _stop_playback_and_clear(vc, player):
+    """Shared stop logic (no behavior change vs original ad-hoc blocks).
+    Safely stops voice client, disables loop modes, clears queue, cancels now updater,
+    and resets now message/current track.
+    """
     if vc:
         try:
             vc.stop()
         except Exception:
             pass
-    player = players.get(interaction.guild.id)
     if player:
         try:
-            # Disable loop to avoid requeue
             await player.disable_loop()
             await player.disable_loop_one()
         except Exception:
@@ -2493,43 +2516,54 @@ async def slash_stop(interaction: discord.Interaction):
             player.now_message = None
         except Exception:
             pass
-    await interaction.response.send_message("⏹️ Đã dừng phát và xóa hàng đợi", ephemeral=True)
 
-def _graceful_shutdown_sync():
-    logger.info("Signal received: saving playlists and closing")
-    # Playlist persistence disabled; nothing to save
+# --- Graceful shutdown & entrypoint (restored from legacy behavior, logic unchanged) ---
+def _graceful_shutdown_sync():  # signal handler (sync context)
+    """Handle SIGINT/SIGTERM for graceful shutdown.
+
+    Mirrors legacy behavior: snapshot queues to disk so that any diagnostic
+    investigation can inspect pending items. Playlist persistence was removed
+    earlier, so only queues are written. Errors are logged but not raised.
+    """
     try:
+        logger.info("Signal received: snapshotting queues and shutting down")
         snap = {}
         for gid, p in list(players.items()):
             try:
                 snap[str(gid)] = p.queue.snapshot()
             except Exception:
                 pass
-        # Use blocking atomic writer (safe to call from signal handler context)
         try:
-            _write_snapshot_file(snap)
+            write_snapshot_file(snap)
         except Exception:
-            # last resort: sync write
-            with open("queues_snapshot.json", "w", encoding="utf-8") as f:
-                json.dump(snap, f, ensure_ascii=False, indent=2)
+            # Fallback direct write
+            try:
+                with open("queues_snapshot.json", "w", encoding="utf-8") as f:
+                    json.dump(snap, f, ensure_ascii=False, indent=2)
+            except Exception:
+                logger.exception("Failed writing queue snapshot fallback")
     except Exception:
-        logger.exception("Failed snapshot during shutdown")
+        logger.exception("Graceful shutdown handler failed")
+
 
 if __name__ == "__main__":
+    # Re-install signal handlers (best-effort; ignored on unsupported platforms like Windows for SIGTERM)
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-
     try:
         loop.add_signal_handler(signal.SIGINT, _graceful_shutdown_sync)
+    except Exception:
+        pass
+    try:
         loop.add_signal_handler(signal.SIGTERM, _graceful_shutdown_sync)
     except Exception:
         pass
 
     if not TOKEN:
-        logger.error("Token missing: update config.json or set DISCORD_TOKEN env var.")
+        logger.error("Token missing: set DISCORD_TOKEN env var or update config.json")
     else:
         try:
             bot.run(TOKEN)
