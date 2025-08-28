@@ -44,6 +44,13 @@ DEFAULT_CONFIG = {
     "now_update_interval_seconds": 12,
     "idle_disconnect_seconds": 300,  # auto-disconnect after 5 minutes idle (was 900)
     "max_track_seconds": 0,
+    # new optional features (non-breaking)
+    "trace_logging": False,
+    "structured_logging": False,
+    "language": "vi",
+    "enable_prometheus": False,
+    "prometheus_port": 9109,
+    "queue_persistence_enabled": False,
 }
 
 def load_config() -> Dict[str, Any]:
@@ -63,7 +70,41 @@ def load_config() -> Dict[str, Any]:
     else:
         config = DEFAULT_CONFIG.copy()
     
-    return config
+    return validate_config(config)
+
+def validate_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate and sanitize configuration values (non-destructive fallback).
+
+    Does not remove existing keys; only adjusts clearly invalid numeric ranges.
+    Logic of application remains unchanged – this merely ensures safe bounds.
+    """
+    changed = False
+    def clamp_int(key, minimum, default):
+        nonlocal changed
+        try:
+            if int(cfg.get(key)) < minimum:
+                logger.warning("Config '%s'=%s < %s; fallback to %s", key, cfg.get(key), minimum, default)
+                cfg[key] = default; changed = True
+        except Exception:
+            logger.warning("Config '%s' invalid (%s); fallback to %s", key, cfg.get(key), default)
+            cfg[key] = default; changed = True
+    clamp_int("max_queue_size", 1, DEFAULT_CONFIG["max_queue_size"])
+    clamp_int("download_concurrency", 1, DEFAULT_CONFIG["download_concurrency"])
+    clamp_int("cache_size_limit", 1, DEFAULT_CONFIG["cache_size_limit"])
+    clamp_int("ffmpeg_threads", 1, DEFAULT_CONFIG["ffmpeg_threads"])
+    clamp_int("now_update_interval_seconds", 3, DEFAULT_CONFIG["now_update_interval_seconds"])
+    clamp_int("idle_disconnect_seconds", 30, DEFAULT_CONFIG["idle_disconnect_seconds"])
+    clamp_int("max_track_seconds", 0, DEFAULT_CONFIG["max_track_seconds"])  # 0 means unlimited
+    profile = cfg.get("stream_profile")
+    if profile not in ("stable", "low-latency", "super-low-latency"):
+        logger.warning("Unknown stream_profile=%s; fallback to 'stable'", profile)
+        cfg["stream_profile"] = "stable"; changed = True
+    if changed:
+        try:
+            persist_config(cfg)
+        except Exception:
+            logger.debug("Persist after validation failed", exc_info=True)
+    return cfg
 
 def get_token() -> str:
     """Get Discord token from environment variables only."""

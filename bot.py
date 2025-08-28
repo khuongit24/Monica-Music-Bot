@@ -28,6 +28,7 @@ from discord.ext import commands
 from discord import ui
 from yt_dlp import YoutubeDL
 import yt_dlp
+import threading
 
 # Import custom modules
 from modules.config import load_env_file, load_config, get_token, persist_config
@@ -35,6 +36,8 @@ from modules.metrics import metric_inc, metric_add_time, metrics_snapshot, get_a
 from modules.utils import THEME_COLOR, OK_COLOR, ERR_COLOR, format_duration, truncate, make_progress_bar, write_snapshot_file
 from modules.voice_manager import get_voice_client_cached, invalidate_voice_cache, cleanup_voice_cache, ensure_connected_for_user
 from modules.audio_processor import sanitize_stream_url, pick_best_audio_url, get_ffmpeg_options_for_profile, create_audio_source, validate_domain
+from modules.ytdl_track import YTDLTrack as ModularYTDLTrack
+from modules.player import MusicPlayer as ModularMusicPlayer
 from modules.cache_manager import get_cache_manager, cleanup_cache_loop
 
 # Load environment variables early
@@ -61,7 +64,7 @@ IDLE_DISCONNECT_SECONDS: int = int(CONFIG.get("idle_disconnect_seconds", 900))
 # streaming profile and now-playing update interval
 STREAM_PROFILE: str = str(CONFIG.get("stream_profile", "stable")).lower().strip() or "stable"
 NOW_UPDATE_INTERVAL: int = max(5, int(CONFIG.get("now_update_interval_seconds", 12)))
-VERSION: str = "v3.5.2"  # Idle disconnect default 300s + player loop logic refinement
+VERSION: str = "v3.8.5" 
 GIT_COMMIT: Optional[str] = os.getenv("GIT_COMMIT") or os.getenv("COMMIT_SHA") or None
 
 # Playbook modes & Spotify removed. Supported sources only.
@@ -69,7 +72,7 @@ MAX_TRACK_SECONDS: int = int(CONFIG.get("max_track_seconds", 0) or 0)
 GLOBAL_ALLOWED_DOMAINS: set[str] = {
     "youtube.com", "www.youtube.com", "youtu.be", "m.youtube.com",
     "soundcloud.com", "m.soundcloud.com",
-    "bandcamp.com",  # generic; subdomains like artist.bandcamp.com handled via endswith
+    "bandcamp.com",  
     "mixcloud.com", "www.mixcloud.com",
     "audius.co", "www.audius.co",
 }
@@ -95,6 +98,10 @@ def set_stream_profile(profile: str) -> str:
         
     Returns:
         The normalized profile name that was set
+                try:
+                    logger.debug("Resolve start query=%s timeout=%s", truncate(key, 200), timeout)
+                except Exception:
+                    pass
         
     Raises:
         ValueError: If profile is not a valid option
@@ -117,23 +124,196 @@ def set_stream_profile(profile: str) -> str:
     logger.info("Stream profile set to %s", STREAM_PROFILE)
     return STREAM_PROFILE
 
-# logging - fixed double setup issue
 logger = logging.getLogger("Monica")
-if not logger.handlers:  # Only setup if handlers don't exist
-    logger.setLevel(logging.INFO)
-    fmt = logging.Formatter("%(asctime)s:%(levelname)s:%(name)s: %(message)s")
-    
-    # Console handler
-    ch = logging.StreamHandler()
-    ch.setFormatter(fmt)
-    logger.addHandler(ch)
-    
-    # File handler with utf-8 encoding
-    fh = RotatingFileHandler("Monica.log", maxBytes=5_000_000, backupCount=3, encoding="utf-8")
-    fh.setFormatter(fmt)
-    logger.addHandler(fh)
-    
-    logger.info("Logger initialized successfully")
+if not logger.handlers:
+    structured = bool(CONFIG.get("structured_logging"))
+    trace_on = bool(CONFIG.get("trace_logging"))
+    if structured:
+        class _JsonFmt(logging.Formatter):
+            def format(self, record):
+                import json, time as _t
+                base = {
+                    "ts": _t.strftime('%Y-%m-%dT%H:%M:%S', _t.gmtime(record.created)),
+                    "lvl": record.levelname,
+                    "logger": record.name,
+                    "msg": record.getMessage(),
+                }
+                if record.exc_info:
+                    base["exc"] = self.formatException(record.exc_info)
+                return json.dumps(base, ensure_ascii=False)
+        fmt_console = _JsonFmt()
+    else:
+        fmt_console = logging.Formatter("%(asctime)s:%(levelname)s:%(name)s: %(message)s")
+    logger.setLevel(logging.DEBUG if trace_on else logging.INFO)
+    ch = logging.StreamHandler(); ch.setFormatter(fmt_console); logger.addHandler(ch)
+    if not structured:
+        fh = RotatingFileHandler("Monica.log", maxBytes=5_000_000, backupCount=3, encoding="utf-8")
+        fh.setFormatter(fmt_console); logger.addHandler(fh)
+    logger.info("Logger initialized (structured=%s trace=%s)", structured, trace_on)
+
+# -----------------------------------------------------------
+# Optional lightweight control endpoint (Phase 2 launcher support)
+# Enabled only if MONICA_CONTROL_PORT environment variable is set.
+# Provides read-only health & metrics. Non-invasive: no change to core logic.
+_CONTROL_SERVER_STARTED = False
+def _maybe_start_control_server():  # minimal inline to avoid circular imports
+    global _CONTROL_SERVER_STARTED
+    if _CONTROL_SERVER_STARTED:
+        return
+    port = os.getenv("MONICA_CONTROL_PORT")
+    if not port:
+        return
+    token = os.getenv("MONICA_CONTROL_TOKEN") or ""
+    try:
+        p = int(port)
+        if not (1024 <= p <= 65535):
+            logger.warning("Control port invalid (out of range): %s", port); return
+    except Exception:
+        logger.warning("Control port invalid (not int): %s", port); return
+    try:
+        import socket, json, threading, traceback
+        from modules.metrics import metrics_snapshot
+        start_ts = time.time()
+        def handler(conn, addr):
+            try:
+                data = conn.recv(4096).decode("utf-8", "ignore")
+                # Very small ad-hoc protocol: single line JSON request, single line JSON response
+                # Expected format: {"op":"health","token":"..."}
+                line = data.strip().splitlines()[-1]
+                try:
+                    req = json.loads(line)
+                except Exception:
+                    conn.sendall(b'{"error":"bad_json"}\n'); return
+                if token and req.get("token") != token:
+                    conn.sendall(b'{"error":"unauthorized"}\n'); return
+                op = req.get("op")
+                if op == "health":
+                    # Compose lightweight state
+                    try:
+                        current_track = None
+                        try:
+                            # Acquire lock because control server handler runs in a plain thread
+                            _players_lock.acquire()
+                            if players:
+                                for _pid, _pl in players.items():
+                                    if getattr(_pl, 'current', None):
+                                        current_track = _pl.current
+                                        break
+                        except Exception:
+                            pass
+                        finally:
+                            try: _players_lock.release()
+                            except Exception: pass
+                        res = {
+                            "status": "running",
+                            "uptime": time.time() - start_ts,
+                            "players": len(players),
+                            "current_title": (current_track or {}).get("title") if current_track else None,
+                        }
+                        conn.sendall((json.dumps(res, ensure_ascii=False) + "\n").encode("utf-8"))
+                    except Exception:
+                        conn.sendall(b'{"error":"health_fail"}\n')
+                elif op == "metrics":
+                    try:
+                        snap = metrics_snapshot()
+                        conn.sendall((json.dumps(snap, ensure_ascii=False)+"\n").encode("utf-8"))
+                    except Exception:
+                        conn.sendall(b'{"error":"metrics_fail"}\n')
+                elif op == "reload":
+                    # Partial hot reload of a safe subset of config keys
+                    try:
+                        payload = req.get("data") or {}
+                        if not isinstance(payload, dict):
+                            conn.sendall(b'{"error":"bad_payload"}\n'); return
+                        changed = {}
+                        allowed = {"ffmpeg_bitrate", "stream_profile"}
+                        global FFMPEG_BITRATE, STREAM_PROFILE
+                        for k, v in payload.items():
+                            if k not in allowed:
+                                continue
+                            try:
+                                if k == "ffmpeg_bitrate":
+                                    # simple validation pattern e.g. '128k'
+                                    if isinstance(v, str) and v.endswith('k') and v[:-1].isdigit():
+                                        FFMPEG_BITRATE = v
+                                        CONFIG[k] = v
+                                        changed[k] = v
+                                elif k == "stream_profile":
+                                    try:
+                                        prev = STREAM_PROFILE
+                                        set_stream_profile(str(v))
+                                        changed[k] = STREAM_PROFILE
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
+                        if changed:
+                            try:
+                                persist_config(CONFIG)
+                            except Exception:
+                                pass
+                        conn.sendall((json.dumps({"ok": True, "changed": changed}, ensure_ascii=False)+"\n").encode("utf-8"))
+                    except Exception:
+                        conn.sendall(b'{"error":"reload_fail"}\n')
+                elif op == "shutdown":
+                    # Launcher initiated shutdown should mirror !shutdown logic:
+                    # snapshot queues, disconnect voice, shutdown executor, close bot.
+                    try:
+                        conn.sendall(b'{"ok":true}\n')
+                        try:
+                            loop = asyncio.get_event_loop()
+                        except Exception:
+                            loop = None
+                        if loop:
+                            try:
+                                loop.call_soon_threadsafe(_schedule_external_shutdown)
+                            except Exception:
+                                # Fallback: brute exit if scheduling fails
+                                try:
+                                    os._exit(0)
+                                except Exception:
+                                    pass
+                        else:
+                            try:
+                                os._exit(0)
+                            except Exception:
+                                pass
+                    except Exception:
+                        try:
+                            conn.sendall(b'{"error":"shutdown_fail"}\n')
+                        except Exception:
+                            pass
+                else:
+                    conn.sendall(b'{"error":"unknown_op"}\n')
+            except Exception:
+                try:
+                    conn.sendall(b'{"error":"internal"}\n')
+                except Exception:
+                    pass
+            finally:
+                try: conn.close()
+                except Exception: pass
+        def server():
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind(("127.0.0.1", int(port)))
+                s.listen(5)
+                logger.info("Control endpoint listening on 127.0.0.1:%s", port)
+                while True:
+                    try:
+                        c, a = s.accept()
+                        threading.Thread(target=handler, args=(c,a), daemon=True).start()
+                    except Exception:
+                        time.sleep(0.5)
+            except Exception:
+                logger.exception("Control server failed to start")
+        threading.Thread(target=server, name="ControlServer", daemon=True).start()
+        _CONTROL_SERVER_STARTED = True
+    except Exception:
+        logger.debug("Control server init failed", exc_info=True)
+
+_maybe_start_control_server()
 
 # discord setup
 intents = discord.Intents.default()
@@ -172,11 +352,22 @@ if FORCE_HIGH_QUALITY:
     try:
         # Only bump if default and not explicitly overridden
         if CONFIG.get("ffmpeg_bitrate") is None or CONFIG.get("ffmpeg_bitrate") == "128k":
-            FFMPEG_BITRATE = "192k"
+            FFMPEG_BITRATE = "256k"
     except Exception:
         pass
     logger.info("High quality mode ON: yt-dlp format=%s ffmpeg_bitrate=%s", YTDL_OPTS.get("format"), FFMPEG_BITRATE)
 ytdl = YoutubeDL(YTDL_OPTS)
+try:
+    import modules.ytdl_track as ytmod
+    ytmod.YTDL_OPTS = YTDL_OPTS
+    ytmod.ytdl = ytdl
+    ytmod.MAX_TRACK_SECONDS = MAX_TRACK_SECONDS
+    # placeholders: actual callables are assigned later after helper definitions
+    ytmod._PICK_BEST_AUDIO_URL = None
+    ytmod._cache_get = None
+    ytmod._cache_put = None
+except Exception:
+    logger.debug("Final injection into modules.ytdl_track failed", exc_info=True)
 # HTTP User-Agent used by ffmpeg for input requests
 HTTP_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -215,8 +406,13 @@ CACHE_LOCK: Optional[asyncio.Lock] = None
 
 # Dedicated thread pool for yt-dlp operations to avoid blocking main thread
 import concurrent.futures
+# Tune threadpool sizing: favor a small pool but allow scaling with CPU and configured concurrency.
+# Heuristic: at least 2 workers, scale with DOWNLOAD_CONCURRENCY*2, cap to reasonable cpu-based max.
+cpu_cnt = os.cpu_count() or 2
+recommended = max(2, DOWNLOAD_CONCURRENCY * 2)
+max_workers = min(recommended, max(4, cpu_cnt))
 _YTDL_EXECUTOR: concurrent.futures.ThreadPoolExecutor = concurrent.futures.ThreadPoolExecutor(
-    max_workers=min(DOWNLOAD_CONCURRENCY * 2, 4),  # Scale with concurrency but cap at 4
+    max_workers=max_workers,
     thread_name_prefix="monica-ytdl"
 )
 
@@ -230,6 +426,32 @@ _RESOLVE_FAIL_THRESHOLD: int = 6  # after 6 consecutive failures, open circuit
 _RESOLVE_COOLDOWN_SECONDS: int = 45
 _RESOLVE_LOCKOUT_UNTIL: float = 0.0  # timestamp until which circuit is open
 _RESOLVE_CIRCUIT_LAST_OPEN_TS: float = 0.0  # timestamp when circuit last opened (0 if closed)
+
+# Inject modular ytdl_track runtime globals (done here after defining runtime values)
+try:
+    import modules.ytdl_track as ytmod
+    ytmod.DOWNLOAD_SEMAPHORE = DOWNLOAD_SEMAPHORE
+    ytmod._YTDL_EXECUTOR = _YTDL_EXECUTOR
+    ytmod._cache_get = None
+    ytmod._cache_put = None
+    try:
+        ytmod.RESOLVE_SEMAPHORE = asyncio.Semaphore(max(1, DOWNLOAD_CONCURRENCY))
+    except Exception:
+        ytmod.RESOLVE_SEMAPHORE = None
+    ytmod.YTDL_OPTS = None  # will be set after YTDL_OPTS defined later
+    ytmod.ytdl = None
+    ytmod.logger = logger
+    ytmod.MAX_TRACK_SECONDS = None
+    ytmod._PICK_BEST_AUDIO_URL = None
+    ytmod._RESOLVING = _RESOLVING
+    ytmod._RESOLVE_LOCK = _RESOLVE_LOCK
+    ytmod._RESOLVE_FAIL_STREAK = _RESOLVE_FAIL_STREAK
+    ytmod._RESOLVE_FAIL_THRESHOLD = _RESOLVE_FAIL_THRESHOLD
+    ytmod._RESOLVE_COOLDOWN_SECONDS = _RESOLVE_COOLDOWN_SECONDS
+    ytmod._RESOLVE_LOCKOUT_UNTIL = _RESOLVE_LOCKOUT_UNTIL
+    ytmod._RESOLVE_CIRCUIT_LAST_OPEN_TS = _RESOLVE_CIRCUIT_LAST_OPEN_TS
+except Exception:
+    logger.debug("Initial injection into modules.ytdl_track failed (will retry after YTDL init)", exc_info=True)
 
 async def _cache_get(key: str) -> Optional[Dict[str, Any]]:
     """Wrapper for backward compatibility - delegates to CacheManager.
@@ -266,6 +488,24 @@ def _pick_best_audio_url(info: Dict[str, Any]) -> Optional[str]:
         Best audio URL if found, None otherwise
     """
     return pick_best_audio_url(info)
+
+# Final injection of helper callables into modules.ytdl_track.
+# This is done here (after helpers are defined) to avoid editor/linter warnings
+# about using names before they're declared. The original placeholder
+# assignments earlier are kept to avoid import-time errors; we finalize them now.
+try:
+    if 'ytmod' in globals():
+        try:
+            ytmod._PICK_BEST_AUDIO_URL = _pick_best_audio_url
+        except Exception:
+            pass
+        try:
+            ytmod._cache_get = _cache_get
+            ytmod._cache_put = _cache_put
+        except Exception:
+            pass
+except Exception:
+    logger.debug("Final helper injection into modules.ytdl_track skipped", exc_info=True)
 
 # Async deque backed queue (single source of truth for playlist)
 class AsyncDequeQueue:
@@ -559,12 +799,18 @@ class YTDLTrack:
         finally:
             try:
                 async with _RESOLVE_LOCK:
-                    _RESOLVING.pop(key, None)
+                    fut_existing = _RESOLVING.get(key)
+                    if fut_existing is None or fut_existing is fut or fut.done() or fut.cancelled():
+                        _RESOLVING.pop(key, None)
             except Exception:
                 pass
             try:
                 elapsed = time.perf_counter() - t_start
                 metric_add_time("resolve_time", elapsed)
+            except Exception:
+                pass
+            try:
+                logger.debug("Resolve finished query=%s elapsed_ms=%d", truncate(key, 200), int((time.perf_counter()-t_start)*1000))
             except Exception:
                 pass
 
@@ -737,6 +983,11 @@ class MusicPlayer:
             size = self.queue.qsize()
             if size >= MAX_QUEUE_SIZE:
                 raise RuntimeError("Hàng đợi đã đầy")
+            try:
+                # annotate enqueue timestamp if not already present
+                data.setdefault("_enqueued_at", time.time())
+            except Exception:
+                pass
             await self.queue.put(data)
             try:
                 self._last_active = time.time()
@@ -810,7 +1061,9 @@ class MusicPlayer:
                 if not snap:
                     continue
                 prefetch_tasks = []
-                for i, item in enumerate(snap[:3]):
+                # adaptive window: up to 5, at least 1, half queue size
+                window = min(5, max(1, max(len(snap)//2, 1)))
+                for i, item in enumerate(snap[:window]):
                     if isinstance(item, dict) and not item.get("url"):
                         query = item.get("webpage_url") or item.get("title") or item.get("query")
                         if query:
@@ -938,7 +1191,7 @@ class MusicPlayer:
                         vc = self.vc or get_voice_client_cached(self.bot, self.guild)
                         if vc and vc.is_connected():
                             try:
-                                await self.text_channel.send("Không ai phát nhạc nên mình đi đây. Hẹn gặp lại ✨")
+                                await self.text_channel.send("Không ai phát nhạc nên mình đi nhaa. Hẹn gặp lại ✨")
                             except Exception:
                                 pass
                             await vc.disconnect()
@@ -995,7 +1248,23 @@ class MusicPlayer:
                     continue
 
                 try:
+                    # latency metric: delay from enqueue (if timestamp stored) to play start
+                    try:
+                        enq_ts = data.get("_enqueued_at")
+                        if enq_ts:
+                            import modules.metrics as _m
+                            _m.metric_add_time("queue_wait_time", max(0.0, time.time() - enq_ts))
+                    except Exception:
+                        pass
                     t0 = time.perf_counter()
+                    # Optional domain safety (already validated at request time for URLs, repeat here defensively)
+                    try:
+                        u = data.get("webpage_url") or data.get("url")
+                        if u and not validate_domain(u, GLOBAL_ALLOWED_DOMAINS):
+                            await self.text_channel.send("Nguồn phát hiện không hợp lệ, bỏ qua.")
+                            continue
+                    except Exception:
+                        pass
                     src = create_audio_source_wrapper(data.get("url"), volume=self.volume)
                 except Exception as e:
                     logger.exception("create_audio_source failed: %s", e)
@@ -1058,6 +1327,11 @@ class MusicPlayer:
                         self.current = data
                         self.history.append(data)
                         metric_inc("playback_start")
+                        try:
+                            import modules.metrics as _m
+                            _m.metric_add_time("play_start_delay", max(0.0, time.perf_counter() - t0))
+                        except Exception:
+                            pass
                         # FFmpeg watchdog: schedule a lightweight poll to detect premature end and restart once
                         async def _watchdog():
                             try:
@@ -1226,6 +1500,8 @@ class MusicPlayer:
 
 # global structures
 players: Dict[int, MusicPlayer] = {}
+# Protect cross-thread access to the players dict (control server may run in plain threads)
+_players_lock = threading.RLock()
 
 def get_player_for_ctx(guild: discord.Guild, text_channel: discord.TextChannel) -> MusicPlayer:
     """Get or create a music player for the given guild and text channel.
@@ -1373,8 +1649,9 @@ class MusicControls(ui.View):
     async def show_queue(self, inter: discord.Interaction, button: ui.Button):
         player = players.get(inter.guild.id)
         if not player or player.queue.empty():
-            await inter.response.send_message("Hàng đợi đang trống, bạn thêm nhạc vào nhé ✨", ephemeral=True); return
-        upcoming = player.queue.snapshot()[:10]
+            await inter.response.send_message("Hàng đợi đang trống, bạn thêm nhạc vào nhé ✨", ephemeral=True)
+            return
+        upcoming = player.queue.snapshot(limit=10)
         text = "\n".join(
             f"{idx+1}. {truncate((item.get('title') if isinstance(item, dict) else str(item)), 50)} — {format_duration(item.get('duration') if isinstance(item, dict) else None)}"
             for idx, item in enumerate(upcoming)
@@ -1521,6 +1798,66 @@ async def on_ready():
         await bot.change_presence(activity=discord.Game(name="/play hoặc /help để bắt đầu ✨"))
     except Exception:
         pass
+    # Optional services (queue persistence & Prometheus exporter)
+    try:
+        if CONFIG.get("queue_persistence_enabled"):
+            from modules.queue_persistence import start as _qp_start
+            asyncio.create_task(_qp_start(lambda: players))
+            logger.info("Queue persistence enabled")
+            # Attempt auto-load (non-intrusive: only logs results)
+            try:
+                from modules.queue_persistence import load_into as _qp_load
+                async def _auto_load():
+                    await asyncio.sleep(2)  # small delay to allow guild cache
+                    def _guild_lookup(gid):
+                        return discord.utils.get(bot.guilds, id=gid)
+                    def _make_player(guild, text_channel):
+                        from modules.player import MusicPlayer as _MP
+                        ch = text_channel or (guild.system_channel or next((c for c in guild.text_channels if c.permissions_for(guild.me).send_messages), None))
+                        if not ch:
+                            return None
+                        try:
+                            p = _MP(guild, ch)
+                            players[guild.id] = p
+                            return p
+                        except Exception:
+                            return None
+                    restored = await _qp_load(players, _make_player, _guild_lookup)  # returns count (currently scaffold)
+                    if restored:
+                        logger.info("Queue persistence restored %s guild(s)", restored)
+                asyncio.create_task(_auto_load())
+            except Exception:
+                logger.debug("Queue auto-load failed", exc_info=True)
+        if CONFIG.get("enable_prometheus"):
+            from modules.metrics_http import start as _mh_start
+            port = int(CONFIG.get("prometheus_port", 9109))
+            asyncio.create_task(_mh_start(port))
+            logger.info("Prometheus exporter enabled on port %s", port)
+        # Optional cache persistence: load and start persistence loop if path configured
+        cache_path = CONFIG.get("cache_persist_path")
+        if cache_path:
+            try:
+                # Best-effort load (non-blocking): schedule after small delay to let caches initialize
+                async def _load_cache():
+                    await asyncio.sleep(1.0)
+                    try:
+                        n = await CACHE_MANAGER.load_from_disk(cache_path)
+                        if n:
+                            logger.info("Loaded %s cache entries from %s", n, cache_path)
+                    except Exception:
+                        logger.debug("Cache auto-load failed", exc_info=True)
+                    # Start persistence loop
+                    try:
+                        import modules.cache_manager as _cm
+                        asyncio.create_task(_cm.persistence_loop(CACHE_MANAGER, cache_path, interval_seconds=int(CONFIG.get("cache_persist_interval", 300))))
+                        logger.info("Cache persistence loop started (path=%s)", cache_path)
+                    except Exception:
+                        logger.debug("Failed to start cache persistence loop", exc_info=True)
+                asyncio.create_task(_load_cache())
+            except Exception:
+                logger.debug("Cache persistence startup failed", exc_info=True)
+    except Exception:
+        logger.debug("Optional services startup failure", exc_info=True)
 
 @bot.event
 async def on_voice_state_update(member: discord.Member, before, after):
@@ -1675,6 +2012,10 @@ async def handle_play_request(ctx_or_interaction, query: str):
     try:
         if getattr(user, 'id', None) is not None:
             data["requested_by_id"] = int(user.id)
+    except Exception:
+        pass
+    try:
+        data.setdefault("_enqueued_at", time.time())
     except Exception:
         pass
     try:
@@ -1847,7 +2188,7 @@ async def text_queue(ctx):
     player = players.get(ctx.guild.id)
     if not player or player.queue.empty():
         await ctx.send("Hàng đợi trống"); return
-    upcoming = player.queue.snapshot()[:10]
+    upcoming = player.queue.snapshot(limit=10)
     text = "\n".join(
         f"{idx+1}. {truncate(item.get('title') if isinstance(item, dict) else str(item), 45)} — {format_duration(item.get('duration') if isinstance(item, dict) else None)}"
         for idx, item in enumerate(upcoming)
@@ -1859,7 +2200,7 @@ async def slash_queue(interaction: discord.Interaction):
     player = players.get(interaction.guild.id)
     if not player or player.queue.empty():
         await interaction.response.send_message("Hàng đợi trống", ephemeral=True); return
-    upcoming = player.queue.snapshot()[:10]
+    upcoming = player.queue.snapshot(limit=10)
     text = "\n".join(
         f"{idx+1}. {truncate(item.get('title') if isinstance(item, dict) else str(item), 45)} — {format_duration(item.get('duration') if isinstance(item, dict) else None)}"
         for idx, item in enumerate(upcoming)
@@ -2133,6 +2474,65 @@ async def slash_config_show(interaction: discord.Interaction):
                 redacted[k] = "***"
     await interaction.response.send_message("```\n" + json.dumps(redacted, ensure_ascii=False, indent=2) + "\n```", ephemeral=True)
 
+@tree.command(name="reload_config", description="Nạp lại một số config động (admin)")
+async def slash_reload_config(interaction: discord.Interaction):
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("Bạn không có quyền", ephemeral=True); return
+    changed = []
+    try:
+        from modules.config import load_config as _lc
+        newc = _lc()
+        global STREAM_PROFILE, NOW_UPDATE_INTERVAL, PREFETCH_NEXT
+        if newc.get("stream_profile") != CONFIG.get("stream_profile"):
+            try:
+                set_stream_profile(newc.get("stream_profile"))
+                changed.append("stream_profile")
+            except Exception as e:
+                logger.warning("Không áp dụng stream_profile mới: %s", e)
+        if int(newc.get("now_update_interval_seconds", NOW_UPDATE_INTERVAL)) != CONFIG.get("now_update_interval_seconds"):
+            CONFIG["now_update_interval_seconds"] = int(newc.get("now_update_interval_seconds", NOW_UPDATE_INTERVAL))
+            NOW_UPDATE_INTERVAL = max(5, int(CONFIG["now_update_interval_seconds"]))
+            changed.append("now_update_interval_seconds")
+        if bool(newc.get("prefetch_next")) != CONFIG.get("prefetch_next"):
+            CONFIG["prefetch_next"] = bool(newc.get("prefetch_next"))
+            PREFETCH_NEXT = CONFIG["prefetch_next"]
+            changed.append("prefetch_next")
+        if bool(newc.get("trace_logging")) != CONFIG.get("trace_logging") or bool(newc.get("structured_logging")) != CONFIG.get("structured_logging"):
+            CONFIG["trace_logging"] = bool(newc.get("trace_logging"))
+            CONFIG["structured_logging"] = bool(newc.get("structured_logging"))
+            changed.append("logging(requires restart)")
+        msg = ("Đã áp dụng: " + ", ".join(changed)) if changed else "Không có thay đổi áp dụng"
+    except Exception as e:
+        msg = f"Lỗi khi reload: {e}"
+    await interaction.response.send_message(msg, ephemeral=True)
+
+@tree.command(name="queue_snapshot", description="Xuất snapshot hàng đợi (admin)")
+async def slash_queue_snapshot(interaction: discord.Interaction):
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("Bạn không có quyền", ephemeral=True); return
+    # thread-safe read of players
+    try:
+        _players_lock.acquire()
+        p = players.get(interaction.guild.id)
+    finally:
+        try: _players_lock.release()
+        except Exception: pass
+    if not p:
+        await interaction.response.send_message("Chưa có player", ephemeral=True); return
+    snap = p.queue.snapshot(limit=10)
+    data = []
+    for item in snap:
+        if isinstance(item, dict):
+            data.append({k: item.get(k) for k in ("title","webpage_url","duration","is_live")})
+        else:
+            data.append(str(item))
+    try:
+        loop = asyncio.get_event_loop()
+        loop.run_in_executor(None, lambda: write_snapshot_file({str(interaction.guild.id): data}))
+        await interaction.response.send_message(f"Đã ghi {len(data)} mục vào queues_snapshot.json (background)", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"Lỗi ghi file: {e}", ephemeral=True)
+
 @bot.command(name="volume")
 async def text_volume(ctx, vol: float):
     player = players.get(ctx.guild.id)
@@ -2193,35 +2593,7 @@ async def slash_reverse(interaction: discord.Interaction):
 @commands.check(lambda ctx: True if OWNER_ID is None else ctx.author.id == int(OWNER_ID))
 async def text_shutdown(ctx):
     await ctx.send("⚠️ Đang tắt bot...")
-    # Playlist persistence disabled; skip saving
-    try:
-        snap = {}
-        for gid, p in list(players.items()):
-            try:
-                snap[str(gid)] = p.queue.snapshot()
-            except Exception:
-                pass
-        # offload blocking atomic write to executor
-        try:
-            loop = asyncio.get_running_loop()
-            loop.run_in_executor(None, lambda: write_snapshot_file(snap))
-        except Exception:
-            # fallback to sync write
-            with open("queues_snapshot.json", "w", encoding="utf-8") as f:
-                json.dump(snap, f, ensure_ascii=False, indent=2)
-    except Exception:
-        logger.exception("Failed to snapshot queues")
-    for vc in list(bot.voice_clients):
-        try:
-            await vc.disconnect()
-        except Exception:
-            pass
-    # Proactively shutdown executor
-    try:
-        _YTDL_EXECUTOR.shutdown(wait=False, cancel_futures=True)
-    except Exception:
-        pass
-    await bot.close()
+    _schedule_external_shutdown()
 
 @tree.command(name="shutdown", description="Tắt bot")
 async def slash_shutdown(interaction: discord.Interaction):
@@ -2229,32 +2601,7 @@ async def slash_shutdown(interaction: discord.Interaction):
         await interaction.response.send_message("Chỉ owner mới có thể tắt bot", ephemeral=True)
         return
     await interaction.response.send_message("⚠️ Đang tắt bot...")
-    # Playlist persistence disabled; skip saving
-    try:
-        snap = {}
-        for gid, p in list(players.items()):
-            try:
-                snap[str(gid)] = p.queue.snapshot()
-            except Exception:
-                pass
-        try:
-            loop = asyncio.get_running_loop()
-            loop.run_in_executor(None, lambda: write_snapshot_file(snap))
-        except Exception:
-            with open("queues_snapshot.json", "w", encoding="utf-8") as f:
-                json.dump(snap, f, ensure_ascii=False, indent=2)
-    except Exception:
-        logger.exception("Failed to snapshot queues")
-    for vc in list(bot.voice_clients):
-        try:
-            await vc.disconnect()
-        except Exception:
-            pass
-    try:
-        _YTDL_EXECUTOR.shutdown(wait=False, cancel_futures=True)
-    except Exception:
-        pass
-    await bot.close()
+    _schedule_external_shutdown()
 
 @bot.command(name="clear_all")
 async def text_clear_all(ctx):
@@ -2528,13 +2875,28 @@ def _graceful_shutdown_sync():  # signal handler (sync context)
     try:
         logger.info("Signal received: snapshotting queues and shutting down")
         snap = {}
-        for gid, p in list(players.items()):
-            try:
-                snap[str(gid)] = p.queue.snapshot()
-            except Exception:
-                pass
         try:
-            write_snapshot_file(snap)
+            _players_lock.acquire()
+            for gid, p in list(players.items()):
+                try:
+                    snap[str(gid)] = p.queue.snapshot()
+                except Exception:
+                    pass
+        finally:
+            try: _players_lock.release()
+            except Exception: pass
+        # Attempt persistence save if enabled
+        try:
+            if CONFIG.get("queue_persistence_enabled"):
+                # Fire-and-forget save_now via event loop thread-safe call
+                loop = asyncio.get_event_loop()
+                from modules.queue_persistence import save_now as _qp_save
+                loop.create_task(_qp_save(players))
+        except Exception:
+            logger.debug("Queue persistence save on shutdown failed", exc_info=True)
+        try:
+            loop = asyncio.get_event_loop()
+            loop.run_in_executor(None, lambda: write_snapshot_file(snap))
         except Exception:
             # Fallback direct write
             try:
@@ -2544,6 +2906,93 @@ def _graceful_shutdown_sync():  # signal handler (sync context)
                 logger.exception("Failed writing queue snapshot fallback")
     except Exception:
         logger.exception("Graceful shutdown handler failed")
+
+# --- Unified external shutdown scheduling (used by control endpoint & commands) ---
+_SHUTDOWN_ALREADY_SCHEDULED = False
+
+def _schedule_external_shutdown():
+    """Schedule asynchronous graceful shutdown identical to !shutdown logic.
+
+    Idempotent: multiple calls only act once. Safe to call from any thread.
+    """
+    global _SHUTDOWN_ALREADY_SCHEDULED
+    if _SHUTDOWN_ALREADY_SCHEDULED:
+        return
+    _SHUTDOWN_ALREADY_SCHEDULED = True
+    try:
+        loop = asyncio.get_event_loop()
+    except Exception:
+        try:
+            os._exit(0)
+        except Exception:
+            return
+
+    async def _do_shutdown():
+        try:
+            # Snapshot queues (best-effort)
+            try:
+                snap = {}
+                try:
+                    _players_lock.acquire()
+                    for gid, p in list(players.items()):
+                        try:
+                            snap[str(gid)] = p.queue.snapshot(limit=20)
+                        except Exception:
+                            pass
+                finally:
+                    try: _players_lock.release()
+                    except Exception: pass
+                try:
+                    loop.run_in_executor(None, lambda: write_snapshot_file(snap))
+                except Exception:
+                    with open("queues_snapshot.json", "w", encoding="utf-8") as f:
+                        json.dump(snap, f, ensure_ascii=False, indent=2)
+            except Exception:
+                logger.exception("Failed to snapshot queues during external shutdown")
+            # Disconnect voice clients
+            # Ask players to cleanup their background tasks (prefetch, now updates, etc.)
+            try:
+                for gid, p in list(players.items()):
+                    try:
+                        if hasattr(p, 'destroy'):
+                            maybe = p.destroy()
+                            if asyncio.iscoroutine(maybe):
+                                await maybe
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            # Disconnect voice clients
+            for vc in list(bot.voice_clients):
+                try:
+                    await vc.disconnect()
+                except Exception:
+                    pass
+            # Stop YTDL executor
+            try:
+                # cancel_futures parameter added in Python 3.9; guard for older versions
+                try:
+                    _YTDL_EXECUTOR.shutdown(wait=False, cancel_futures=True)
+                except TypeError:
+                    # Older Python: call without cancel_futures
+                    _YTDL_EXECUTOR.shutdown(wait=False)
+            except Exception:
+                pass
+            try:
+                await bot.close()
+            except Exception:
+                pass
+        finally:
+            # Always exit with code 0 for controlled shutdown
+            try:
+                os._exit(0)
+            except Exception:
+                pass
+
+    try:
+        loop.create_task(_do_shutdown())
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
@@ -2569,3 +3018,37 @@ if __name__ == "__main__":
             bot.run(TOKEN)
         except Exception as e:
             logger.exception("Bot terminated with exception: %s", e)
+        # Post-run cleanup (best effort for optional services)
+        try:
+            if CONFIG.get("queue_persistence_enabled"):
+                from modules.queue_persistence import stop as _qp_stop, save_now as _qp_save
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(_qp_save(players))
+                loop.run_until_complete(_qp_stop())
+                loop.close()
+        except Exception:
+            logger.debug("Queue persistence stop failed", exc_info=True)
+        try:
+            if CONFIG.get("enable_prometheus"):
+                from modules.metrics_http import stop as _mh_stop
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(_mh_stop())
+                loop.close()
+        except Exception:
+            logger.debug("Prometheus exporter stop failed", exc_info=True)
+        try:
+            cache_path = CONFIG.get("cache_persist_path")
+            if cache_path:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    loop.run_until_complete(CACHE_MANAGER.save_to_disk(cache_path))
+                    logger.info("Cache persisted to %s on shutdown", cache_path)
+                except Exception:
+                    logger.debug("Cache persist on shutdown failed", exc_info=True)
+                finally:
+                    loop.close()
+        except Exception:
+            logger.debug("Cache persistence shutdown failed", exc_info=True)

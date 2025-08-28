@@ -1,16 +1,4 @@
 {
-  "token": "",
   "prefix": "!",
-  "owner_id": null,
-  "max_queue_size": 400,
-  "download_concurrency": 4,
-  "cache_size_limit": 1000,
-  "ffmpeg_bitrate": "96k",
-  "ffmpeg_threads": 2,
-  "prefetch_next": true,
-  "stream_profile": "stable",
-  "now_update_interval_seconds": 12,
-  "idle_disconnect_seconds": 300,
-  "playback_mode": "global",
-  "cache_ttl_seconds": 3600
+  "ffmpeg_bitrate": "192k"
 }

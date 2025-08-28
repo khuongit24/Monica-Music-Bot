@@ -6,11 +6,21 @@ Handles stream profiles, audio source creation, and URL sanitization.
 import logging
 from typing import Optional, Tuple
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
+from functools import lru_cache
 import discord
 
 logger = logging.getLogger("Monica.AudioProcessor")
 
+# Expose heuristic tuning options (can be adjusted at runtime by bot if desired)
+PICKER_CONFIG = {
+    "hls_penalty": 1200,
+    "opus_bonus": 1200,
+    "aac_bonus": 800,
+    "container_bonus": {"webm": 600, "opus": 600, "ogg": 600, "m4a": 550, "mp3": 300},
+}
 
+
+@lru_cache(maxsize=256)
 def sanitize_stream_url(url: Optional[str]) -> Optional[str]:
     """Strip problematic query params (like range=) that can cause mid-track starts.
 
@@ -33,14 +43,16 @@ def sanitize_stream_url(url: Optional[str]) -> Optional[str]:
 
 
 def pick_best_audio_url(info: dict) -> Optional[str]:
-    """Choose the highest quality reasonable audio format.
+    """Select the best quality audio URL with a more aggressive quality heuristic.
 
-    Strategy (quality-first):
-    1. Filter to audio-only (no video) formats with a valid abr (audio bitrate).
-    2. Prefer highest abr, then preferred container (m4a > webm > others).
-    3. Penalize HLS/m3u8 unless it's the only option.
-    4. Avoid formats with large non-zero start_time.
-    5. Fallback to original 'url' if present and no formats scored.
+    Updated strategy (quality-first, low rebuffer risk):
+    1. Filter to audio-capable formats (ignore those with acodec 'none').
+    2. Score primarily by audio bitrate (abr).
+    3. Strong bonus for Opus codec (already optimized for Discord) then AAC.
+    4. Container preference: webm/opus > m4a > webm > others.
+    5. Penalize HLS/m3u8 (higher latency / instability) unless only option.
+    6. Penalize large positive start_time (partial segment).
+    7. Fallback to single direct 'url' if formats list unusable.
     """
     direct = info.get("url")
     formats = info.get("formats") or []
@@ -62,37 +74,48 @@ def pick_best_audio_url(info: dict) -> Optional[str]:
 
     def score(f):
         score = 0
-        # Primary: audio bitrate
+        # Primary: audio bitrate (abr)
         abr = f.get("abr")
         try:
             if abr:
-                score += int(abr) * 10  # weight bitrate strongly
+                score += int(abr) * 12  # slightly higher weight than before
         except Exception:
             pass
+        # Codec preference
+        acodec = (f.get("acodec") or "").lower()
+        if "opus" in acodec:
+            score += PICKER_CONFIG.get("opus_bonus", 1200)
+        elif "aac" in acodec or "mp4a" in acodec:
+            score += PICKER_CONFIG.get("aac_bonus", 800)
+        elif acodec and acodec != "none":
+            score += 200
         # Container preference
         ext = (f.get("ext") or "").lower()
-        if ext == "m4a":
-            score += 500
-        elif ext == "webm":
-            score += 400
+        score += PICKER_CONFIG.get("container_bonus", {}).get(ext, 0)
         # Penalize HLS/m3u8 unless only choice
         proto = (f.get("protocol") or "").lower()
         if ("m3u8" in proto) or ("hls" in proto):
-            score -= 800
+            score -= PICKER_CONFIG.get("hls_penalty", 900)
         # Prefer audio-only
         if f.get("vcodec") in (None, "none"):
-            score += 100
+            score += 150
         # Penalize offset starts
         try:
             st = f.get("start_time")
-            if st and float(st) > 0.5:
-                score -= 1000
+            if st and float(st) > 0.25:
+                score -= 1200
         except Exception:
             pass
         return score
 
     try:
         best = max(candidates, key=score)
+        try:
+            # Store picked format metadata for downstream optimizations (non-breaking extra keys)
+            info.setdefault("_picked_fmt_ext", (best.get("ext") or "").lower())
+            info.setdefault("_picked_fmt_acodec", (best.get("acodec") or "").lower())
+        except Exception:
+            pass
         return sanitize_stream_url(best.get("url"))
     except Exception:
         return sanitize_stream_url(direct)
@@ -138,13 +161,50 @@ def get_ffmpeg_options_for_profile(stream_profile: str, volume: float, ffmpeg_bi
 
 
 def create_audio_source(stream_url: str, volume: float, stream_profile: str, ffmpeg_bitrate: str, ffmpeg_threads: int, http_ua: str):
-    """Create Discord audio source with profile-specific FFmpeg options."""
+    """Create Discord audio source optimizing for maximum audio quality.
+
+    Quality improvements:
+    - If volume is 1.0 and source appears to be Opus (webm/opus/ogg), attempt stream copy (-c:a copy) to avoid re-encode.
+    - Falls back to previous transcode path for other codecs or when volume != 1.0 (need volume filter).
+    """
     stream_url = sanitize_stream_url(stream_url) or stream_url
     before, options = get_ffmpeg_options_for_profile(stream_profile, volume, ffmpeg_bitrate, ffmpeg_threads, http_ua)
-    kwargs = {"before_options": before, "options": options}
-    
+
+    # Detect if we can copy the stream (saves quality & CPU) only when no volume change
+    lower_url = (stream_url or "").lower()
+    # Broaden copy detection by also considering picked format metadata if present in URL query (can't access full info dict here directly)
+    # Heuristic: if URL hints opus/webm/ogg OR bitrate <= 160k (already efficient) and volume unchanged, attempt copy.
+    copy_candidate = volume == 1.0 and any(tok in lower_url for tok in (".webm", ".opus", ".ogg", "mime=audio%2Fwebm", "mime=audio/webm"))
+    if copy_candidate:
+        # Replace audio options part after '-vn' with copy; preserve before-options and minimal flags
+        # We'll keep analyze/probe adjustments from profile for stability, but strip re-encode flags
+        try:
+            # Basic safe options for copy
+            if stream_profile == "stable":
+                copy_opts = '-vn -c:a copy -ar 48000 -ac 2 -fflags +genpts -avoid_negative_ts make_zero -nostats -loglevel error'
+            else:
+                copy_opts = '-vn -c:a copy -ar 48000 -ac 2 -nostats -loglevel error'
+            options = copy_opts
+        except Exception:
+            pass
+
+    # If high bitrate (>192k) and not copying, lightly enlarge buffer to reduce under-runs (non-breaking augmentation)
     try:
-        logger.info("FFmpeg profile=%s options=%s", stream_profile, options)
+        br_num = int(str(ffmpeg_bitrate).lower().replace('k','').strip() or 0)
+    except Exception:
+        br_num = 0
+    if br_num >= 192 and not copy_candidate:
+        # Append extra buffer flags if not already present
+        if "-bufsize" not in options:
+            options += " -bufsize 2M"
+        if "-rtbufsize" not in options:
+            options += " -rtbufsize 2M"
+        # Increase thread queue size if present in before options
+        if "-thread_queue_size" in before:
+            before = before.replace("-thread_queue_size 1024", "-thread_queue_size 2048")
+    kwargs = {"before_options": before, "options": options}
+    try:
+        logger.info("FFmpeg profile=%s copy=%s options=%s", stream_profile, copy_candidate, options)
         return discord.FFmpegOpusAudio(stream_url, **kwargs)
     except Exception as e:
         logger.warning("FFmpegOpusAudio failed (%s); fallback to PCM", e)

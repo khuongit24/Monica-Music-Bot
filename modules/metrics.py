@@ -9,6 +9,10 @@ _METRICS = {
     "resolve_success": 0,
     "resolve_fail": 0,
     "resolve_circuit_open": 0,
+    "resolve_queue_len": 0,
+    "download_semaphore_waits": 0,
+    # number of times circuit transitioned to open (distinct events)
+    "resolve_circuit_open_events": 0,
     "cache_hits": 0,
     "cache_miss": 0,
     "queue_add": 0,
@@ -18,9 +22,18 @@ _METRICS = {
     "resolve_time_total_seconds": 0.0,
     "resolve_time_count": 0,
     "ffmpeg_restarts": 0,
+    "ffmpeg_restart_count": 0,
     # prefetch related
     "prefetch_resolved": 0,
     "prefetch_idle_cycles": 0,
+    "prefetch_inplace_updates": 0,
+    # observability / rare conditions
+    "queue_unknown_type": 0,
+    # latency metrics (average derived from *_total_seconds / *_count)
+    "play_start_delay_total_seconds": 0.0,
+    "play_start_delay_count": 0,
+    "queue_wait_time_total_seconds": 0.0,
+    "queue_wait_time_count": 0,
 }
 
 def metric_inc(name: str, delta: int = 1):
@@ -47,3 +60,11 @@ def get_average_resolve_time() -> float:
     total = _METRICS.get("resolve_time_total_seconds", 0.0)
     count = _METRICS.get("resolve_time_count", 0) or 0
     return (total / count) if count else 0.0
+
+
+def set_gauge(name: str, value):
+    """Set a gauge-like metric to a specific value."""
+    try:
+        _METRICS[name] = value
+    except Exception:
+        pass

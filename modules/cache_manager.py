@@ -10,6 +10,8 @@ from collections import OrderedDict
 from typing import Dict, Any, Optional
 
 from modules.metrics import metric_inc
+import json
+import os
 
 logger = logging.getLogger("Monica.CacheManager")
 
@@ -155,6 +157,39 @@ class CacheManager:
             
             if expired_keys:
                 logger.debug("Cleaned up %d expired cache entries", len(expired_keys))
+
+    async def save_to_disk(self, path: str) -> None:
+        """Persist lean cache to disk as JSON (best-effort)."""
+        self._ensure_lock()
+        async with self._lock:
+            try:
+                lean_dump = {k: {"data": v["data"], "ts": v.get("ts"), "ttl": v.get("ttl"), "hits": v.get("hits", 0)} for k, v in self._cache.items()}
+                tmp = path + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    json.dump(lean_dump, fh)
+                os.replace(tmp, path)
+                metric_inc("cache_persist_save")
+                logger.debug("Cache persisted to %s", path)
+            except Exception:
+                logger.exception("Failed to persist cache")
+
+    async def load_from_disk(self, path: str) -> int:
+        """Load persisted cache if available. Returns number of entries loaded."""
+        self._ensure_lock()
+        if not os.path.exists(path):
+            return 0
+        async with self._lock:
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+                for k, v in data.items():
+                    self._cache[k] = {"data": v.get("data"), "ts": v.get("ts", time.time()), "ttl": v.get("ttl", self.ttl_seconds), "hits": v.get("hits", 0)}
+                metric_inc("cache_persist_load")
+                logger.debug("Loaded %d cache entries from %s", len(data), path)
+                return len(data)
+            except Exception:
+                logger.exception("Failed to load cache from disk")
+                return 0
     
     def get_stats(self) -> Dict[str, Any]:
         """Get cache statistics."""
@@ -193,3 +228,13 @@ async def cleanup_cache_loop(cache_mgr: CacheManager):
         except Exception:
             logger.exception("Cache cleanup error")
         await asyncio.sleep(60 * 5)  # Clean up every 5 minutes
+
+
+async def persistence_loop(cache_mgr: CacheManager, path: str, interval_seconds: int = 60*5):
+    """Periodically persist cache to disk."""
+    while True:
+        try:
+            await cache_mgr.save_to_disk(path)
+        except Exception:
+            logger.exception("Cache persistence error")
+        await asyncio.sleep(interval_seconds)

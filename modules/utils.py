@@ -5,6 +5,7 @@ import time
 import json
 import os
 import logging
+import asyncio
 from typing import Optional, Dict, Any
 
 logger = logging.getLogger("Monica.Utils")
@@ -63,3 +64,33 @@ def write_snapshot_file(snap: dict):
             os.rename(tmp, "queues_snapshot.json")
     except Exception:
         logger.exception("Failed to write snapshot file")
+
+
+def _safe_create_task(coro, loop: Optional[asyncio.AbstractEventLoop] = None) -> asyncio.Task:
+    """Create an asyncio.Task in a safe way using provided loop or current running loop.
+
+    Falls back to loop.call_soon_threadsafe/asyncio.ensure_future when needed.
+    """
+    try:
+        if loop is None:
+            loop = asyncio.get_running_loop()
+        return loop.create_task(coro)
+    except RuntimeError:
+        # Not in event loop thread; schedule creation via call_soon_threadsafe
+        if loop is None:
+            loop = asyncio.get_event_loop()
+        fut = asyncio.Future()
+
+        def _create():
+            try:
+                t = asyncio.ensure_future(coro)
+                fut.set_result(t)
+            except Exception as e:
+                fut.set_exception(e)
+
+        try:
+            loop.call_soon_threadsafe(_create)
+            return asyncio.get_event_loop().run_until_complete(fut)
+        except Exception:
+            # Worst-case fallback: ensure_future in current context
+            return asyncio.ensure_future(coro)
