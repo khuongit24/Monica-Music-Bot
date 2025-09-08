@@ -31,7 +31,7 @@ CONFIG_PATH = "config.json"
 DEFAULT_CONFIG = {
     # Token should NEVER be in config file - use environment variables only
     "prefix": "!",
-    "owner_id": None,
+    "owner_id": 1019539342621949983,
     "max_queue_size": 200,
     "download_concurrency": 2,
     "cache_size_limit": 200,

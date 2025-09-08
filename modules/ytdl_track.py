@@ -29,6 +29,10 @@ _RESOLVE_LOCKOUT_UNTIL = None
 _RESOLVE_CIRCUIT_LAST_OPEN_TS = None
 _PLUGIN_HOOKS = {"on_track_resolved": []}  # simple extensibility point
 
+# Negative cache (short TTL) to avoid repeated failing resolves for the same query
+_NEG_CACHE: Dict[str, tuple[float, str]] = {}
+_NEG_TTL_SECONDS = 20.0  # keep failures for a short time only
+
 # --- Helpers ---
 def _truncate_query(q: str, limit: int = 200) -> str:
     try:
@@ -133,6 +137,20 @@ class YTDLTrack:
         key = query.strip()
         t_start = time.perf_counter()
 
+        # Negative cache fast-path
+        try:
+            neg = _NEG_CACHE.get(key)
+            if neg:
+                ts, msg = neg
+                if (time.time() - ts) < _NEG_TTL_SECONDS:
+                    metric_inc("resolve_fail")
+                    raise RuntimeError(msg or "Nguồn tạm thời không khả dụng, thử lại sau ít phút")
+                else:
+                    # expired
+                    _NEG_CACHE.pop(key, None)
+        except Exception:
+            pass
+
         if logger:
             try:
                 logger.debug("Resolve start query=%s timeout=%s", _truncate_query(key), timeout)
@@ -232,16 +250,13 @@ class YTDLTrack:
                 # --- execute_primary + fallback_chain ---
                 # Optional global throttle: if RESOLVE_SEMAPHORE provided, use it to limit concurrent owners
                 if RESOLVE_SEMAPHORE is not None:
-                    try:
-                        # record waiting on semaphore for metrics
-                        try: metric_inc("download_semaphore_waits")
-                        except Exception: pass
-                        async with RESOLVE_SEMAPHORE:
-                            data = await _execute_with_fallbacks(query, timeout)
-                    except Exception:
-                        raise
+                    # record waiting on semaphore for metrics
+                    try: metric_inc("download_semaphore_waits")
+                    except Exception: pass
+                    async with RESOLVE_SEMAPHORE:
+                        data = await _execute_with_retries(query, timeout)
                 else:
-                    data = await _execute_with_fallbacks(query, timeout)
+                    data = await _execute_with_retries(query, timeout)
 
                 # --- url_finalize ---
                 data = _finalize_and_pick_url(data)
@@ -306,6 +321,11 @@ class YTDLTrack:
 
             try:
                 _safe_set_future_exception(fut, e)
+            except Exception:
+                pass
+            # Negative cache the failure (short TTL)
+            try:
+                _NEG_CACHE[key] = (time.time(), str(e))
             except Exception:
                 pass
             # Ensure mapping cleaned up immediately to avoid stuck futures
@@ -423,6 +443,39 @@ async def _execute_with_fallbacks(query: str, timeout: float):
                 raise RuntimeError("Không tìm thấy mục trong kết quả")
             data = entries[0]
         return data
+
+async def _execute_with_retries(query: str, timeout: float):
+    """Execute resolve with limited retries, exponential backoff and jitter.
+    Keeps behavior of _execute_with_fallbacks but retries on transient failures.
+    """
+    # Step timeouts: ensure each attempt bounded; overall retries limited
+    per_attempt_timeout = max(5.0, min(20.0, float(timeout)))
+    attempts = 3
+    delay = 0.5
+    last_exc = None
+    for i in range(attempts):
+        try:
+            return await _execute_with_fallbacks(query, per_attempt_timeout)
+        except asyncio.TimeoutError as e:
+            last_exc = e
+        except RuntimeError as e:
+            # treat known non-retriable messages as final
+            msg = str(e).lower()
+            if "không tìm" in msg or "vượt giới hạn" in msg:
+                raise
+            last_exc = e
+        except Exception as e:
+            last_exc = e
+        # backoff with jitter (cap)
+        try:
+            import random
+            await asyncio.sleep(min(4.0, delay + random.uniform(0, 0.25)))
+        except Exception:
+            await asyncio.sleep(delay)
+        delay *= 2
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Resolve thất bại (không xác định)")
 
 def _finalize_and_pick_url(data: dict) -> dict:
     if not data.get("url"):

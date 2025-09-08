@@ -339,9 +339,16 @@ class MusicPlayer:
                     try:
                         elapsed = time.time() - started_at
                         bar = make_progress_bar(elapsed, duration)
-                        embed = create_now_playing_embed(self.current, extra_desc=bar)
+                        embed = create_now_playing_embed(self.current, extra_desc=bar, stream_profile=STREAM_PROFILE)
                         await self.now_message.edit(embed=embed, view=_Controls(self.guild.id))
+                    except discord.NotFound:
+                        # Tin nhắn đã bị xóa -> tạo lại
+                        try:
+                            self.now_message = await self.text_channel.send(embed=embed, view=_Controls(self.guild.id))
+                        except Exception:
+                            pass
                     except discord.HTTPException:
+                        # Lỗi tạm thời -> bỏ qua vòng này
                         pass
                     await asyncio.sleep(NOW_UPDATE_INTERVAL)
             except asyncio.CancelledError:
@@ -516,7 +523,7 @@ class MusicPlayer:
                         except Exception: pass
                         continue
                 try:
-                    embed = create_now_playing_embed(data)
+                    embed = create_now_playing_embed(data, stream_profile=STREAM_PROFILE)
                     if self.now_message:
                         try:
                             edit_fn = getattr(self.now_message, "edit", None)
@@ -525,10 +532,19 @@ class MusicPlayer:
                             else:
                                 self.now_message = await self.text_channel.send(embed=embed, view=_Controls(self.guild.id))
                         except Exception:
-                            try: self.now_message = await self.text_channel.send(embed=embed, view=_Controls(self.guild.id))
-                            except Exception: logger.exception("Failed to send now-playing embed (both edit and send failed)")
+                            try:
+                                self.now_message = await self.text_channel.send(embed=embed, view=_Controls(self.guild.id))
+                            except Exception:
+                                logger.exception("Failed to send now-playing embed (both edit and send failed)")
                     else:
                         self.now_message = await self.text_channel.send(embed=embed, view=_Controls(self.guild.id))
+                    # Gắn tham chiếu message cho View nếu có để on_timeout có thể làm mới
+                    try:
+                        if self.now_message and getattr(self.now_message, 'components', None):
+                            view = _Controls(self.guild.id)
+                            view.message = self.now_message
+                    except Exception:
+                        pass
                     await self._start_now_update(played_at, data.get("duration"))
                 except Exception:
                     logger.exception("Failed to send now-playing embed")

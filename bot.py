@@ -34,11 +34,16 @@ import threading
 from modules.config import load_env_file, load_config, get_token, persist_config
 from modules.metrics import metric_inc, metric_add_time, metrics_snapshot, get_average_resolve_time
 from modules.utils import THEME_COLOR, OK_COLOR, ERR_COLOR, format_duration, truncate, make_progress_bar, write_snapshot_file
+from modules.messages import msg
 from modules.voice_manager import get_voice_client_cached, invalidate_voice_cache, cleanup_voice_cache, ensure_connected_for_user
 from modules.audio_processor import sanitize_stream_url, pick_best_audio_url, get_ffmpeg_options_for_profile, create_audio_source, validate_domain
 from modules.ytdl_track import YTDLTrack as ModularYTDLTrack
 from modules.player import MusicPlayer as ModularMusicPlayer
 from modules.cache_manager import get_cache_manager, cleanup_cache_loop
+# Group 2 refactor imports: command handler delegations
+from modules.commands import playback as cmd_playback
+from modules.commands import queue as cmd_queue
+from modules.ui_runtime import build_now_embed as ui_build_now_embed, start_now_updater as ui_start_now_updater
 
 # Load environment variables early
 load_env_file()
@@ -64,7 +69,7 @@ IDLE_DISCONNECT_SECONDS: int = int(CONFIG.get("idle_disconnect_seconds", 900))
 # streaming profile and now-playing update interval
 STREAM_PROFILE: str = str(CONFIG.get("stream_profile", "stable")).lower().strip() or "stable"
 NOW_UPDATE_INTERVAL: int = max(5, int(CONFIG.get("now_update_interval_seconds", 12)))
-VERSION: str = "v3.8.5" 
+VERSION: str = "v3.9.4" 
 GIT_COMMIT: Optional[str] = os.getenv("GIT_COMMIT") or os.getenv("COMMIT_SHA") or None
 
 # Playbook modes & Spotify removed. Supported sources only.
@@ -600,13 +605,25 @@ class AsyncDequeQueue:
             self._dq = deque(new)
             return removed
 
-    def snapshot(self) -> List[Any]:
-        """Get a snapshot of all items in the queue without removing them.
-        
+    def snapshot(self, limit: Optional[int] = None) -> List[Any]:
+        """Get a snapshot of items in the queue without removing them.
+
+        Args:
+            limit: If provided, return at most the first `limit` items.
+
         Returns:
-            List containing all items currently in the queue
+            List containing up to `limit` items (or all items if limit is None)
         """
-        return list(self._dq)
+        if limit is None:
+            return list(self._dq)
+        if limit <= 0:
+            return []
+        res: List[Any] = []
+        for i, item in enumerate(self._dq):
+            if i >= limit:
+                break
+            res.append(item)
+        return res
 
     def qsize(self) -> int:
         """Get the current size of the queue.
@@ -846,6 +863,12 @@ class MusicPlayer:
     for a specific Discord server.
     """
     
+    class State:
+        INIT = "init"
+        ACTIVE = "active"
+        CLOSING = "closing"
+        CLOSED = "closed"
+
     def __init__(self, guild: discord.Guild, text_channel: discord.TextChannel) -> None:
         """Initialize music player for a guild.
         
@@ -886,7 +909,9 @@ class MusicPlayer:
         except Exception:
             # fallback
             self._task = asyncio.create_task(self._player_loop())
+        # lifecycle
         self._closing: bool = False
+        self.state: str = MusicPlayer.State.INIT
         self._lock: asyncio.Lock = asyncio.Lock()
         self.prefetch_task: Optional[asyncio.Task[None]] = None
         self.vc: Optional[discord.VoiceClient] = None
@@ -901,6 +926,8 @@ class MusicPlayer:
                 self.prefetch_task = asyncio.create_task(self._prefetch_worker())
             except Exception:
                 self.prefetch_task = None
+        # move to active when constructed
+        self.state = MusicPlayer.State.ACTIVE
     @staticmethod
     def _tracks_equal(a: Any, b: Any) -> bool:
         """Compare two tracks for equality based on URL or title+duration.
@@ -1131,6 +1158,9 @@ class MusicPlayer:
     # (Idle watchdog removed; periodic progress handled elsewhere)
 
     async def _start_now_update(self, started_at: float, duration: Optional[float]):
+        # Dùng MusicControls chuẩn từ modules.ui_components để đồng bộ trạng thái nút
+        from modules.ui_components import MusicControls as _Controls
+
         async def updater():
             try:
                 while True:
@@ -1139,8 +1169,7 @@ class MusicPlayer:
                     try:
                         elapsed = time.time() - started_at
                         bar = make_progress_bar(elapsed, duration)
-                        embed = self._build_now_embed(self.current, extra_desc=bar)
-                        await self.now_message.edit(embed=embed, view=MusicControls(self.guild.id))
+                        await self.now_message.edit(embed=ui_build_now_embed(self.current, extra_desc=bar), view=_Controls(self.guild.id))
                     except discord.HTTPException:
                         pass
                     await asyncio.sleep(NOW_UPDATE_INTERVAL)
@@ -1148,35 +1177,85 @@ class MusicPlayer:
                 return
             except Exception:
                 logger.exception("Now update task failed")
+
         if self.now_update_task and not self.now_update_task.done():
             self.now_update_task.cancel()
         try:
-            self.now_update_task = self._loop.create_task(updater())
+            self.now_update_task = ui_start_now_updater(self, started_at, duration, NOW_UPDATE_INTERVAL, STREAM_PROFILE)
         except Exception:
             self.now_update_task = asyncio.create_task(updater())
 
     def _build_now_embed(self, data: dict, extra_desc: Optional[str] = None) -> discord.Embed:
-    # Build now-playing embed
-        title = truncate(data.get("title", "Now Playing"), 80)
-        embed = discord.Embed(
-            title=title,
-            url=data.get("webpage_url"),
-            color=THEME_COLOR,
-            timestamp=discord.utils.utcnow(),
-            description=(f"{'🔴 LIVE' if data.get('is_live') else '🎧 Now Playing'}\n"
-                         f"{extra_desc if extra_desc else ''}")
-        )
-        if data.get("thumbnail"):
-            embed.set_thumbnail(url=data.get("thumbnail"))
-        embed.add_field(name="👤 Nghệ sĩ", value=truncate(data.get("uploader") or "Unknown", 64), inline=True)
-        embed.add_field(name="⏱️ Thời lượng", value=format_duration(data.get("duration")), inline=True)
-        if data.get("requested_by"):
-            embed.add_field(name="🙋 Yêu cầu", value=truncate(data.get("requested_by"), 30), inline=True)
         try:
-            embed.set_footer(text=f"Profile: {STREAM_PROFILE} • Sẽ mất thêm vài giây để mình xử lý yêu cầu. Bạn chịu khó đợi thêm chút nha 💕")
+            return ui_build_now_embed(data, extra_desc=extra_desc, stream_profile=STREAM_PROFILE)
+        except Exception:
+            # Fallback (giữ nguyên như cũ)
+            title = truncate(data.get("title", "Now Playing"), 80)
+            embed = discord.Embed(
+                title=title,
+                url=data.get("webpage_url"),
+                color=THEME_COLOR,
+                timestamp=discord.utils.utcnow(),
+                description=(f"{'🔴 LIVE' if data.get('is_live') else '🎧 Now Playing'}\n"
+                             f"{extra_desc if extra_desc else ''}")
+            )
+            if data.get("thumbnail"):
+                embed.set_thumbnail(url=data.get("thumbnail"))
+            embed.add_field(name="👤 Nghệ sĩ", value=truncate(data.get("uploader") or "Unknown", 64), inline=True)
+            embed.add_field(name="⏱️ Thời lượng", value=format_duration(data.get("duration")), inline=True)
+            if data.get("requested_by"):
+                embed.add_field(name="🙋 Yêu cầu", value=truncate(data.get("requested_by"), 30), inline=True)
+            try:
+                embed.set_footer(text=f"Sẽ mất thêm vài giây để mình xử lý yêu cầu. Bạn chịu khó đợi thêm chút nha 💕")
+            except Exception:
+                pass
+            return embed
+
+    async def graceful_shutdown(self) -> None:
+        """Tắt player an toàn: hủy task nền, dừng voice, xóa queue, reset state.
+        Không ném lỗi ra ngoài. Idempotent.
+        """
+        if self.state in (MusicPlayer.State.CLOSING, MusicPlayer.State.CLOSED):
+            return
+        self.state = MusicPlayer.State.CLOSING
+        self._closing = True
+        # Cancel background tasks
+        try:
+            if self.now_update_task and not self.now_update_task.done():
+                self.now_update_task.cancel()
         except Exception:
             pass
-        return embed
+        try:
+            if self.prefetch_task and not self.prefetch_task.done():
+                self.prefetch_task.cancel()
+        except Exception:
+            pass
+        # Stop voice playback & disconnect
+        try:
+            if self.vc:
+                try:
+                    if getattr(self.vc, "is_playing", lambda: False)():
+                        self.vc.stop()
+                except Exception:
+                    pass
+                try:
+                    await self.vc.disconnect()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # Clear queue and reset pointers
+        try:
+            await self.clear_all()
+        except Exception:
+            pass
+        try:
+            self.current = None
+            self.now_message = None
+        except Exception:
+            pass
+        # mark closed
+        self.state = MusicPlayer.State.CLOSED
 
     async def _player_loop(self):
         logger.info("Player start guild=%s", self.guild.id)
@@ -1207,7 +1286,8 @@ class MusicPlayer:
                     if not data.get("url"):
                         try:
                             resolved = await YTDLTrack.resolve(data.get("webpage_url") or data.get("title") or data.get("query"))
-                            data = dict(resolved.data)
+                            track = resolved
+                            data = track.data
                             if item.get("requested_by"):
                                 data["requested_by"] = item.get("requested_by")
                         except Exception as e:
@@ -1217,10 +1297,12 @@ class MusicPlayer:
                             except Exception:
                                 pass
                             continue
-                    track = YTDLTrack(data)
-                elif isinstance(item, YTDLTrack):
-                    track = item
-                    data = track.data
+                    else:
+                        # Đảm bảo track có thuộc tính .data để requeue hợp lệ trong loop modes
+                        try:
+                            track = YTDLTrack(data)
+                        except Exception:
+                            track = None
                 elif isinstance(item, str):
                     try:
                         track = await YTDLTrack.resolve(item)
@@ -1232,13 +1314,6 @@ class MusicPlayer:
                         except Exception:
                             pass
                         continue
-                else:
-                    logger.error("Unknown queue item type: %s", type(item))
-                    try:
-                        metric_inc("queue_unknown_type")  # Low: observability metric
-                    except Exception:
-                        pass
-                    continue
 
                 if not data or not data.get("url"):
                     try:
@@ -1248,7 +1323,7 @@ class MusicPlayer:
                     continue
 
                 try:
-                    # latency metric: delay from enqueue (if timestamp stored) to play start
+                    # latency metric: delay from enqueue (nếu có timestamp) tới start tạo source
                     try:
                         enq_ts = data.get("_enqueued_at")
                         if enq_ts:
@@ -1265,7 +1340,24 @@ class MusicPlayer:
                             continue
                     except Exception:
                         pass
-                    src = create_audio_source_wrapper(data.get("url"), volume=self.volume)
+                    # Tạo source với retry/backoff ngắn để vượt qua các lỗi mạng tạm thời của FFmpeg
+                    retries = 2
+                    delay = 0.4
+                    last_exc = None
+                    for _i in range(retries + 1):
+                        try:
+                            src = create_audio_source_wrapper(data.get("url"), volume=self.volume)
+                            break
+                        except Exception as ee:
+                            last_exc = ee
+                            if _i >= retries:
+                                raise
+                            try:
+                                import random
+                                await asyncio.sleep(delay + random.uniform(0, 0.2))
+                            except Exception:
+                                await asyncio.sleep(delay)
+                            delay *= 2
                 except Exception as e:
                     logger.exception("create_audio_source failed: %s", e)
                     try:
@@ -1363,22 +1455,23 @@ class MusicPlayer:
                 try:
                     embed = self._build_now_embed(data)
                     # Try to edit existing now_message if possible; otherwise send a new one.
+                    from modules.ui_components import MusicControls as _Controls
                     if self.now_message:
                         try:
                             edit_fn = getattr(self.now_message, "edit", None)
                             if callable(edit_fn):
-                                await edit_fn(embed=embed, view=MusicControls(self.guild.id))
+                                await edit_fn(embed=embed, view=_Controls(self.guild.id))
                             else:
                                 # can't edit (old object/API), send a new message and replace
-                                self.now_message = await self.text_channel.send(embed=embed, view=MusicControls(self.guild.id))
+                                self.now_message = await self.text_channel.send(embed=embed, view=_Controls(self.guild.id))
                         except Exception:
                             # if edit fails for any reason, send a fresh message and replace
                             try:
-                                self.now_message = await self.text_channel.send(embed=embed, view=MusicControls(self.guild.id))
+                                self.now_message = await self.text_channel.send(embed=embed, view=_Controls(self.guild.id))
                             except Exception:
                                 logger.exception("Failed to send now-playing embed (both edit and send failed)")
                     else:
-                        self.now_message = await self.text_channel.send(embed=embed, view=MusicControls(self.guild.id))
+                        self.now_message = await self.text_channel.send(embed=embed, view=_Controls(self.guild.id))
 
                     await self._start_now_update(played_at, data.get("duration"))
                 except Exception:
@@ -1423,9 +1516,15 @@ class MusicPlayer:
             logger.exception("Unhandled in player loop guild=%s: %s", self.guild.id, e)
         finally:
             try:
+                _players_lock.acquire()
                 players.pop(self.guild.id, None)
             except Exception:
                 pass
+            finally:
+                try:
+                    _players_lock.release()
+                except Exception:
+                    pass
             try:
                 if self.prefetch_task and not self.prefetch_task.done():
                     self.prefetch_task.cancel()
@@ -1448,9 +1547,15 @@ class MusicPlayer:
         logger.debug("Destroying player for guild %s", self.guild.id)
         
         try:
+            _players_lock.acquire()
             players.pop(self.guild.id, None)
         except Exception as e:
             logger.debug("Error removing player from global dict: %s", e)
+        finally:
+            try:
+                _players_lock.release()
+            except Exception:
+                pass
             
         # Cancel all running tasks
         tasks_to_cancel = [
@@ -1518,168 +1623,27 @@ def get_player_for_ctx(guild: discord.Guild, text_channel: discord.TextChannel) 
     """
     if guild is None:
         raise RuntimeError("No guild in context")
-    player = players.get(guild.id)
-    if not player:
-        player = MusicPlayer(guild=guild, text_channel=text_channel)
-        players[guild.id] = player
-    return player
-
-# UI controls
-class MusicControls(ui.View):
-    """Discord UI View for music playback controls.
-    
-    Provides buttons for pause/resume, skip, volume control, and other
-    music player operations with proper permission checking.
-    """
-    
-    def __init__(self, guild_id: int, *, timeout: float = 300) -> None:
-        """Initialize music controls for a guild.
-        
-        Args:
-            guild_id: Discord guild ID this control panel belongs to
-            timeout: How long to wait before timing out the view
-        """
-        super().__init__(timeout=timeout)
-        self.guild_id: int = guild_id
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        """Check if user can interact with music controls.
-        
-        Args:
-            interaction: Discord interaction to validate
-            
-        Returns:
-            True if user can use controls, False otherwise
-        """
-        if not interaction.user.voice or not interaction.user.voice.channel:
-            await interaction.response.send_message("Bạn phải ở trong kênh thoại để điều chỉnh nhạc", ephemeral=True)
-            return False
-        vc = discord.utils.get(bot.voice_clients, guild=interaction.guild)
-        if not vc or not vc.is_connected():
-            await interaction.response.send_message("Mình chưa kết nối kênh thoại nào cả :<", ephemeral=True)
-            return False
-        if interaction.user.voice.channel.id != vc.channel.id:
-            await interaction.response.send_message("Bạn phải ở cùng kênh thoại với bot để điều khiển", ephemeral=True)
-            return False
-        # refresh player's activity to avoid idle disconnect during interaction
-        try:
-            p = players.get(interaction.guild.id)
-            if p:
-                p._last_active = time.time()
-        except Exception:
-            logger.debug("interaction_check: failed updating last_active", exc_info=True)
-        return True
-
-    @ui.button(emoji="⏯️", label="Tạm dừng/Tiếp tục", style=discord.ButtonStyle.primary, row=0)
-    async def pause_resume(self, inter: discord.Interaction, button: ui.Button) -> None:
-        """Toggle pause/resume for current track.
-        
-        Args:
-            inter: Discord interaction from button press
-            button: The button that was pressed
-        """
-        vc = discord.utils.get(bot.voice_clients, guild=inter.guild)
-        if not vc or not getattr(vc, "source", None):
-            await inter.response.send_message("Không có bài nào đang phát", ephemeral=True)
-            return
-        if vc.is_paused():
-            vc.resume(); await inter.response.send_message("▶️ Tiếp tục phát nhạc", ephemeral=True)
-        elif vc.is_playing():
-            vc.pause(); await inter.response.send_message("⏸️ Đã tạm dừng nhạc", ephemeral=True)
-        else:
-            await inter.response.send_message("Không thể điều chỉnh hiện tại", ephemeral=True)
-
-    @ui.button(emoji="⏭️", label="Bỏ qua", style=discord.ButtonStyle.secondary, row=0)
-    async def skip(self, inter: discord.Interaction, button: ui.Button):
-        vc = discord.utils.get(bot.voice_clients, guild=inter.guild)
-        if not vc or not vc.is_playing():
-            await inter.response.send_message("Không có bài nhạc nào để bỏ qua", ephemeral=True); return
-        player = players.get(inter.guild.id)
+    # Bảo vệ mutate với RLock; không await trong vùng khóa
+    _players_lock.acquire()
+    try:
+        player = players.get(guild.id)
         if not player:
-            vc.stop(); await inter.response.send_message("⏭️ Đã bỏ qua bài nhạc", ephemeral=True); return
-        # If queue is empty, do not stop current; notify user
-        if player.queue.empty():
-            await inter.response.send_message("Không có bài nhạc nào kế tiếp để mình chuyển qua, bạn thêm bài hát mới vào nhé 😋", ephemeral=True)
-            return
-        # There is next track; if loop_one is enabled, keep it for next track as well
-        keep_loop_one = bool(player.loop_one)
-        # If loop-one is active, suppress the immediate requeue of the just-stopped track
-        if keep_loop_one:
-            player._suppress_loop_requeue_once = True
-        vc.stop()
-        await inter.response.send_message("⏭️ Đã bỏ qua bài nhạc", ephemeral=True)
-
-    @ui.button(emoji="⏹️", label="Dừng phát", style=discord.ButtonStyle.danger, row=0)
-    async def stop(self, inter: discord.Interaction, button: ui.Button):
-        vc = discord.utils.get(bot.voice_clients, guild=inter.guild)
-        if vc:
-            try:
-                vc.stop()
-            except Exception:
-                logger.debug("stop button: vc.stop failed", exc_info=True)
-        # Do not disconnect the bot here. Stop playback and clear queue so users
-        # can resume without reconnecting.
-        player = players.get(inter.guild.id)
-        if player:
-            try:
-                await player.disable_loop()
-            except Exception:
-                logger.debug("stop button: disable_loop failed", exc_info=True)
-            try:
-                await player.clear_all()
-            except Exception:
-                logger.debug("stop button: clear_all failed", exc_info=True)
-            # stop current playback if present
-            try:
-                if player.vc and getattr(player.vc, "is_playing", lambda: False)():
-                    player.vc.stop()
-            except Exception:
-                logger.debug("stop button: stopping current source failed", exc_info=True)
-            # clear now-playing state
-            try:
-                player.current = None
-                if player.now_update_task and not player.now_update_task.done():
-                    player.now_update_task.cancel()
-                player.now_message = None
-            except Exception:
-                logger.debug("stop button: clearing now-playing state failed", exc_info=True)
-        await inter.response.send_message("⏹️ Đã dừng phát và xóa hàng đợi", ephemeral=True)
-
-    @ui.button(emoji="📜", label="Hàng đợi", style=discord.ButtonStyle.secondary, row=1)
-    async def show_queue(self, inter: discord.Interaction, button: ui.Button):
-        player = players.get(inter.guild.id)
-        if not player or player.queue.empty():
-            await inter.response.send_message("Hàng đợi đang trống, bạn thêm nhạc vào nhé ✨", ephemeral=True)
-            return
-        upcoming = player.queue.snapshot(limit=10)
-        text = "\n".join(
-            f"{idx+1}. {truncate((item.get('title') if isinstance(item, dict) else str(item)), 50)} — {format_duration(item.get('duration') if isinstance(item, dict) else None)}"
-            for idx, item in enumerate(upcoming)
-        )
-        embed = discord.Embed(title="Queue (next up)", description=text or "Trống", color=0x2F3136)
-        await inter.response.send_message(embed=embed, ephemeral=True)
-
-    # Loop actions available via /loop, /loop_all, /unloop
-
-    @ui.button(emoji="↩️", label="Quay lại", style=discord.ButtonStyle.secondary, row=1)
-    async def reverse(self, inter: discord.Interaction, button: ui.Button):
-        """Requeue the last played track (from history) and play it next.
-
-        This mirrors the behavior of the text/slash `reverse` command.
-        """
-        player = players.get(inter.guild.id)
-        if not player or not player.history:
-            await inter.response.send_message("Không có lịch sử bài hát để quay lại.", ephemeral=True)
-            return
+            player = MusicPlayer(guild=guild, text_channel=text_channel)
+            players[guild.id] = player
+        return player
+    finally:
         try:
-            last = await player.play_previous_now()
-            if not last:
-                await inter.response.send_message("Không có lịch sử bài hát để quay lại.", ephemeral=True)
-                return
+            _players_lock.release()
         except Exception:
-            await inter.response.send_message("Không có lịch sử bài hát để quay lại.", ephemeral=True)
-            return
-        await inter.response.send_message(f"↩️ Đang chuyển về: {truncate(last.get('title') if isinstance(last, dict) else str(last), 80)}", ephemeral=True)
+            pass
+
+"""UI controls alias
+
+Đồng bộ hóa nguồn sự thật cho giao diện điều khiển về modules/ui_components.
+Giữ alias để các đoạn code cũ trong bot.py (nếu có) vẫn import được MusicControls.
+"""
+from modules.ui_components import MusicControls
+ 
 
 
 # Report Modal and commands
@@ -1732,7 +1696,11 @@ async def slash_report(interaction: discord.Interaction):
             except Exception:
                 pass
             return
-        await interaction.response.send_modal(ReportModal(interaction.user, interaction.guild))
+        try:
+            from modules.ui_components import ReportModal as _ReportModal
+            await interaction.response.send_modal(_ReportModal(interaction.user, interaction.guild))
+        except Exception:
+            await interaction.response.send_modal(ReportModal(interaction.user, interaction.guild))
     except discord.NotFound as e:
         # 10062 Unknown interaction — typically expired interaction token; don't spam error logs
         logger.warning("Report modal failed: unknown interaction (likely expired): %s", e)
@@ -1895,7 +1863,14 @@ async def on_voice_state_update(member: discord.Member, before, after):
             except Exception:
                 logger.exception("Auto voice reconnect failed")
         # If no queue or reconnect failed, destroy player
-        player = players.pop(before.channel.guild.id, None)
+        try:
+            _players_lock.acquire()
+            player = players.pop(before.channel.guild.id, None)
+        finally:
+            try:
+                _players_lock.release()
+            except Exception:
+                pass
         if player:
             player.destroy()
             logger.info("Player destroyed due to bot voice disconnect in guild %s", before.channel.guild.id)
@@ -1940,12 +1915,39 @@ async def handle_play_request(ctx_or_interaction, query: str):
     # Quick ack: let user know we're searching/processing for stability
     ack_msg = None
     try:
+        # Random search messages để tạo surprise và thân thiện
+        search_messages = [
+            {
+                "title": "🔍 Monica đang tìm kiếm...",
+                "desc": "🧐 Đang khám phá kho nhạc khổng lồ để tìm cho bạn bài phù hợp nhất! ✨"
+            },
+            {
+                "title": "🎯 Đang truy tìm bản nhạc...",
+                "desc": "🚀 Monica sẽ dùng siêu năng lực để tìm kiếm cho bạn đây! 🌟"
+            },
+            {
+                "title": "🎪 Chuẩn bị phát nhạc...",
+                "desc": "🎶 Đang chuẩn bị món quà âm nhạc tuyệt vời dành riêng cho bạn! 🎁"
+            },
+            {
+                "title": "🌊 Đang lặn sâu...",
+                "desc": "🏄‍♀️ Monica đang đi vào đại dương nhạc để tìm bài nhạc của bạn đây~ 💎"
+            },
+            {
+                "title": "🎨 Đang vẽ nên giai điệu...",
+                "desc": "🖌️ Chờ Monica một chút nhé 🎼"
+            }
+        ]
+        
+        import random
+        selected_msg = random.choice(search_messages)
+        
         ack_embed = discord.Embed(
-            title="Monica đang tìm kiếm... 🔎",
-            description=f"{truncate(query, 100)}\nBạn hãy đợi vài giây để mình tìm kiếm nhạc cho bạn nhé 💕",
+            title=selected_msg["title"],
+            description=f"**🎵 Đang tìm:** {truncate(query, 80)}\n\n{selected_msg['desc']}\n\n⏱️ *Chỉ cần vài giây thôi, bạn kiên nhẫn nhé!* 💕",
             color=THEME_COLOR,
         )
-        ack_embed.set_footer(text=f"Monica {VERSION} • By shio")
+        ack_embed.set_footer(text=f"✨ Monica {VERSION} • 🎧 Mang âm nhạc đến mọi nơi!")
         if isinstance(ctx_or_interaction, discord.Interaction):
             # For deferred interactions, use followup
             try:
@@ -1967,13 +1969,20 @@ async def handle_play_request(ctx_or_interaction, query: str):
         except Exception:
             logger.exception("Connect failed")
             try:
+                try:
+                    from modules.ui_components import create_error_embed as _err
+                except Exception:
+                    _err = None
                 if ack_msg is not None:
-                    await ack_msg.edit(content=None, embed=discord.Embed(title="❌ Không thể kết nối kênh thoại", color=ERR_COLOR))
+                    if _err:
+                        await ack_msg.edit(content=None, embed=_err(msg("VOICE_CONNECT_FAIL"), title="❌ Không thể kết nối kênh thoại"))
+                    else:
+                        await ack_msg.edit(content=None, embed=discord.Embed(title="❌ Không thể kết nối kênh thoại", color=ERR_COLOR))
                 else:
                     if isinstance(ctx_or_interaction, discord.Interaction):
-                        await ctx_or_interaction.response.send_message("Không thể kết nối vào kênh thoại", ephemeral=True)
+                        await ctx_or_interaction.response.send_message(msg("VOICE_CONNECT_FAIL"), ephemeral=True)
                     else:
-                        await ctx_or_interaction.send("Không thể kết nối kênh thoại.")
+                        await ctx_or_interaction.send(msg("VOICE_CONNECT_FAIL"))
             except Exception:
                 pass
             return
@@ -1995,9 +2004,15 @@ async def handle_play_request(ctx_or_interaction, query: str):
     except Exception as e:
         logger.exception("Resolve failed: %s", e)
         try:
-            err_embed = discord.Embed(title="❌ Lỗi khi tìm kiếm", description=str(e), color=ERR_COLOR)
+            try:
+                from modules.ui_components import create_error_embed as _err
+            except Exception:
+                _err = None
             if ack_msg is not None:
-                await ack_msg.edit(content=None, embed=err_embed)
+                if _err:
+                    await ack_msg.edit(content=None, embed=_err(str(e), title="❌ Lỗi khi tìm kiếm"))
+                else:
+                    await ack_msg.edit(content=None, embed=discord.Embed(title="❌ Lỗi khi tìm kiếm", description=str(e), color=ERR_COLOR))
             else:
                 if isinstance(ctx_or_interaction, discord.Interaction):
                     await ctx_or_interaction.response.send_message(f"Lỗi khi tìm kiếm: {e}", ephemeral=True)
@@ -2024,8 +2039,15 @@ async def handle_play_request(ctx_or_interaction, query: str):
     except Exception as e:
         logger.exception("Add track failed: %s", e)
         try:
+            try:
+                from modules.ui_components import create_error_embed as _err
+            except Exception:
+                _err = None
             if ack_msg is not None:
-                await ack_msg.edit(content=None, embed=discord.Embed(title="❌ Không thể thêm vào hàng đợi", description=str(e), color=ERR_COLOR))
+                if _err:
+                    await ack_msg.edit(content=None, embed=_err(str(e), title="❌ Không thể thêm vào hàng đợi"))
+                else:
+                    await ack_msg.edit(content=None, embed=discord.Embed(title="❌ Không thể thêm vào hàng đợi", description=str(e), color=ERR_COLOR))
             else:
                 if isinstance(ctx_or_interaction, discord.Interaction):
                     await ctx_or_interaction.response.send_message(str(e), ephemeral=True)
@@ -2036,21 +2058,12 @@ async def handle_play_request(ctx_or_interaction, query: str):
         return
 
     try:
-    # Queue-added embed
-        desc_title = truncate(track.title or "Đã thêm vào hàng đợi", 80)
-        embed = discord.Embed(
-            title="✅ Đã thêm vào hàng đợi",
-            url=(track.data.get("webpage_url") if isinstance(track, YTDLTrack) else None),
-            description=desc_title,
-            color=OK_COLOR,
-        )
-        if track.data.get("thumbnail"):
-            embed.set_thumbnail(url=track.data.get("thumbnail"))
-        if track.data.get("uploader"):
-            embed.add_field(name="👤 Nghệ sĩ", value=truncate(track.data.get("uploader"), 64), inline=True)
-        if track.data.get("duration"):
-            embed.add_field(name="⏱️ Thời lượng", value=format_duration(track.data.get("duration")), inline=True)
-        embed.set_footer(text="Nếu gặp bạn gặp phải lỗi gì thì dùng /report để được hỗ trợ sửa lỗi nhanh chóng nhé ✨")
+        # Queue-added embed (chuẩn hóa)
+        try:
+            from modules.ui_components import create_queue_add_embed as _qadd
+        except Exception:
+            _qadd = None
+        embed = _qadd(track.data) if _qadd else discord.Embed(title="✅ Đã thêm vào hàng đợi", description=truncate(track.title or "Đã thêm vào hàng đợi", 80), color=OK_COLOR)
         if ack_msg is not None:
             try:
                 await ack_msg.edit(embed=embed)
@@ -2107,40 +2120,28 @@ async def text_join(ctx):
 @discord.app_commands.describe(query="URL hoặc tên bài (YouTube)")
 async def slash_play(interaction: discord.Interaction, query: str):
     await interaction.response.defer(thinking=True)
-    await handle_play_request(interaction, query)
+    await cmd_playback.handle_play(sys.modules[__name__], interaction, query)
 
 
 @bot.command(name="play")
 async def text_play(ctx, *, query: str):
-    await handle_play_request(ctx, query)
+    await cmd_playback.handle_play(sys.modules[__name__], ctx, query)
 
 @bot.command(name="pause")
 async def text_pause(ctx):
-    vc = discord.utils.get(bot.voice_clients, guild=ctx.guild)
-    if not vc or not vc.is_playing():
-        await ctx.send("Không có bài nhạc nào đang phát"); return
-    vc.pause(); await ctx.send("⏸️ Đã tạm dừng")
+    await cmd_playback.handle_pause(bot, ctx)
 
 @tree.command(name="pause", description="Tạm dừng nhạc")
 async def slash_pause(interaction: discord.Interaction):
-    vc = discord.utils.get(bot.voice_clients, guild=interaction.guild)
-    if not vc or not vc.is_playing():
-        await interaction.response.send_message("Không có bài nhạc nào đang phát", ephemeral=True); return
-    vc.pause(); await interaction.response.send_message("⏸️ Đã tạm dừng.", ephemeral=True)
+    await cmd_playback.handle_pause(bot, interaction)
 
 @bot.command(name="resume")
 async def text_resume(ctx):
-    vc = discord.utils.get(bot.voice_clients, guild=ctx.guild)
-    if not vc or not vc.is_paused():
-        await ctx.send("Không có bài nhạc nào bị tạm dừng"); return
-    vc.resume(); await ctx.send("▶️ Đã tiếp tục phát")
+    await cmd_playback.handle_resume(bot, ctx)
 
 @tree.command(name="resume", description="Tiếp tục phát")
 async def slash_resume(interaction: discord.Interaction):
-    vc = discord.utils.get(bot.voice_clients, guild=interaction.guild)
-    if not vc or not vc.is_paused():
-        await interaction.response.send_message("Không có bài nhạc nào bị tạm dừng", ephemeral=True); return
-    vc.resume(); await interaction.response.send_message("▶️ Tiếp tục phát", ephemeral=True)
+    await cmd_playback.handle_resume(bot, interaction)
 
 @bot.command(name="skip")
 async def text_skip(ctx):
@@ -2185,27 +2186,11 @@ async def slash_skip(interaction: discord.Interaction):
 
 @bot.command(name="queue")
 async def text_queue(ctx):
-    player = players.get(ctx.guild.id)
-    if not player or player.queue.empty():
-        await ctx.send("Hàng đợi trống"); return
-    upcoming = player.queue.snapshot(limit=10)
-    text = "\n".join(
-        f"{idx+1}. {truncate(item.get('title') if isinstance(item, dict) else str(item), 45)} — {format_duration(item.get('duration') if isinstance(item, dict) else None)}"
-        for idx, item in enumerate(upcoming)
-    )
-    await ctx.send(embed=discord.Embed(title="Queue (next up)", description=text, color=0x2F3136))
+    await cmd_queue.show_queue_public(players, ctx)
 
 @tree.command(name="queue", description="Hiện 10 bài nhạc tiếp theo")
 async def slash_queue(interaction: discord.Interaction):
-    player = players.get(interaction.guild.id)
-    if not player or player.queue.empty():
-        await interaction.response.send_message("Hàng đợi trống", ephemeral=True); return
-    upcoming = player.queue.snapshot(limit=10)
-    text = "\n".join(
-        f"{idx+1}. {truncate(item.get('title') if isinstance(item, dict) else str(item), 45)} — {format_duration(item.get('duration') if isinstance(item, dict) else None)}"
-        for idx, item in enumerate(upcoming)
-    )
-    await interaction.response.send_message(embed=discord.Embed(title="Queue (next up)", description=text, color=0x2F3136), ephemeral=True)
+    await cmd_queue.show_queue_ephemeral(players, interaction)
 
 @bot.command(name="now")
 async def text_now(ctx):
@@ -2564,30 +2549,13 @@ async def text_reverse(ctx):
             await ctx.send("Không có lịch sử bài hát để quay lại.")
             return
     except Exception:
-        await ctx.send("Không có lịch sử bài hát để quay lại."); return
-    try:
-        metric_inc("reverse_usage")  # Low: usage metric
-    except Exception:
-        pass
-    await ctx.send(f"↩️ Đang chuyển về: {truncate(last.get('title') if isinstance(last, dict) else str(last), 80)}")
-
-
-@tree.command(name="reverse", description="Quay lại bài vừa phát")
-async def slash_reverse(interaction: discord.Interaction):
-    player = players.get(interaction.guild.id)
-    if not player or not player.history:
-        await interaction.response.send_message("Không có lịch sử bài hát để quay lại.", ephemeral=True); return
-    try:
-        last = await player.play_previous_now()
-        if not last:
-            await interaction.response.send_message("Không có lịch sử bài hát để quay lại.", ephemeral=True); return
-    except Exception:
-        await interaction.response.send_message("Không có lịch sử bài hát để quay lại.", ephemeral=True); return
+        await ctx.send("Không có lịch sử bài hát để quay lại.")
+        return
     try:
         metric_inc("reverse_usage")
     except Exception:
         pass
-    await interaction.response.send_message(f"↩️ Đang chuyển về: {truncate(last.get('title') if isinstance(last, dict) else str(last), 80)}", ephemeral=True)
+    await ctx.send(f"↩️ Đang chuyển về: {truncate(last.get('title') if isinstance(last, dict) else str(last), 80)}")
 
 @bot.command(name="shutdown")
 @commands.check(lambda ctx: True if OWNER_ID is None else ctx.author.id == int(OWNER_ID))
@@ -2717,63 +2685,52 @@ async def text_unloop(ctx):
 @tree.command(name="unloop", description="Tắt mọi chế độ loop (loop bài & loop toàn bộ hàng đợi)")
 async def slash_unloop(interaction: discord.Interaction):
     player = players.get(interaction.guild.id)
-    if player:
-        try:
-            await player.disable_loop()
-            await player.disable_loop_one()
-        except Exception:
-            pass
-    await interaction.response.send_message("⛔ Đã tắt tất cả chế độ loop.", ephemeral=True)
+    if not player:
+        await interaction.response.send_message("Không có phiên phát để tắt loop.", ephemeral=True)
+        return
+    try:
+        await player.disable_loop()
+        await player.disable_loop_one()
+    except Exception:
+        pass
+    await interaction.response.send_message("⛔ Đã tắt tất cả chế độ loop (loop bài & loop hàng đợi).", ephemeral=True)
 
 
-    # recreate the missing text-based help command
-@bot.command(name="help")
-async def text_help(ctx):
-    embed = discord.Embed(
-        title="Monica Bot — Trợ giúp",
-        color=0x5865F2,
-        description="Các nhóm lệnh chính"
-    )
-    embed.add_field(name="Phát nhạc", value="/join • /play <query> • /pause • /resume • /skip • /stop • /leave", inline=False)
-    embed.add_field(name="Hàng đợi", value="/queue • /clear <tên> • /clear_all • /reverse", inline=False)
-    embed.add_field(name="Loop / Lịch sử", value="/loop (loop 1 bài) • /loop_all (loop hàng đợi) • /unloop (tắt cả hai) • /reverse", inline=False)
-    embed.add_field(name="Thông tin / Giám sát", value="/now • /stats • /health • /metrics • /version", inline=False)
-    embed.add_field(name="Cấu hình / Debug", value="/profile • /volume • /debug_track <query> • /config_show", inline=False)
-    embed.add_field(name="Báo cáo", value="/report (hoặc !report) để mở form gửi lỗi / góp ý", inline=False)
-    embed.add_field(name="Nguồn hỗ trợ", value="YouTube • SoundCloud • Bandcamp • Mixcloud • Audius", inline=False)
-
-    disclaimer_text = (
-        "Monica Music Bot chỉ được phép sử dụng cho mục đích cá nhân và không thương mại.\n"
-        "Tác giả từ chối mọi trách nhiệm phát sinh từ việc sử dụng hoặc lạm dụng phần mềm này."
-    )
-    embed.add_field(name="Disclaimer", value=disclaimer_text, inline=False)
-    embed.set_footer(text=f"Monica Music Bot {VERSION} • By shio")
-    await ctx.send(embed=embed)
-
-
-@tree.command(name="help", description="Hiện help embed")
+@tree.command(name="help", description="Hiện giao diện trợ giúp")
 async def slash_help(interaction: discord.Interaction):
-    embed = discord.Embed(
-        title="Monica Bot — Help", 
-        color=0x5865F2, 
-        description="Các nhóm lệnh chính"
-    )
-    embed.add_field(name="Phát nhạc", value="/join • /play <query> • /pause • /resume • /skip • /stop • /leave", inline=False)
-    embed.add_field(name="Hàng đợi", value="/queue • /clear <tên> • /clear_all • /reverse", inline=False)
-    embed.add_field(name="Loop / Lịch sử", value="/loop (loop 1 bài) • /loop_all (loop hàng đợi) • /unloop (tắt cả hai) • /reverse", inline=False)
-    embed.add_field(name="Thông tin / Giám sát", value="/now • /stats • /health • /metrics • /version", inline=False)
-    embed.add_field(name="Cấu hình / Debug", value="/profile • /volume • /debug_track <query> • /config_show", inline=False)
-    embed.add_field(name="Báo cáo", value="/report (hoặc !report) để mở form gửi lỗi / góp ý", inline=False)
-    embed.add_field(name="Nguồn hỗ trợ", value="YouTube • SoundCloud • Bandcamp • Mixcloud • Audius", inline=False)
-
-    disclaimer_text = (
-        "Monica Music Bot chỉ được phép sử dụng cho mục đích cá nhân và không thương mại.\n"
-        "Tác giả từ chối mọi trách nhiệm phát sinh từ việc sử dụng hoặc lạm dụng phần mềm này."
-    )
-    embed.add_field(name="Disclaimer", value=disclaimer_text, inline=False)
-    embed.set_footer(text=f"Monica Music Bot {VERSION} • By shio")
-
-    await interaction.response.send_message(embed=embed)
+    try:
+        logger.info("Attempting to import HelpView and create_help_embed")
+        from modules.ui_components import HelpView, create_help_embed
+        logger.info("Import successful, creating embed")
+        embed = create_help_embed(
+            "overview", prefix=PREFIX, version=VERSION, stream_profile=STREAM_PROFILE
+        )
+        logger.info("Embed created, creating view")
+        view = HelpView(prefix=PREFIX, version=VERSION, stream_profile=STREAM_PROFILE)
+        logger.info("View created, sending message")
+        await interaction.response.send_message(embed=embed, view=view)
+        logger.info("New Help UI sent successfully")
+    except Exception as e:
+        logger.error("Help UI failed with error: %s", e, exc_info=True)
+        embed = discord.Embed(
+            title="Monica Bot — Help", 
+            color=0x5865F2, 
+            description="Các nhóm lệnh chính"
+        )
+        embed.add_field(name="Phát nhạc", value="/join • /play <query> • /pause • /resume • /skip • /stop • /leave", inline=False)
+        embed.add_field(name="Hàng đợi", value="/queue • /clear <tên> • /clear_all • /reverse", inline=False)
+        embed.add_field(name="Loop / Lịch sử", value="/loop (loop 1 bài) • /loop_all (loop hàng đợi) • /unloop (tắt cả hai) • /reverse", inline=False)
+        embed.add_field(name="Thông tin / Giám sát", value="/now • /stats • /health • /metrics • /version", inline=False)
+        embed.add_field(name="Cấu hình / Debug", value="/profile • /volume • /debug_track <query> • /config_show", inline=False)
+        embed.add_field(name="Báo cáo", value="/report (hoặc !report) để mở form gửi lỗi / góp ý", inline=False)
+        embed.add_field(name="Nguồn hỗ trợ", value="YouTube • SoundCloud • Bandcamp • Mixcloud • Audius", inline=False)
+        disclaimer_text = (
+            "Monica Music Bot chỉ được phép sử dụng cho mục đích cá nhân và không thương mại.\n"
+            "Tác giả từ chối mọi trách nhiệm phát sinh từ việc sử dụng hoặc lạm dụng phần mềm này."
+        )
+        embed.add_field(name="Disclaimer", value=disclaimer_text, inline=False)
+        embed.set_footer(text=f"Monica Music Bot {VERSION} • By shio")
+        await interaction.response.send_message(embed=embed)
 
 
 # error handlers
@@ -2803,7 +2760,14 @@ async def text_leave(ctx):
     try:
         await vc.disconnect()
     finally:
-        p = players.pop(ctx.guild.id, None)
+        try:
+            _players_lock.acquire()
+            p = players.pop(ctx.guild.id, None)
+        finally:
+            try:
+                _players_lock.release()
+            except Exception:
+                pass
         if p:
             p.destroy()
     await ctx.send("Mình đã rời kênh thoại rùi, hẹn gặp lại :3")
@@ -2817,7 +2781,14 @@ async def slash_leave(interaction: discord.Interaction):
     try:
         await vc.disconnect()
     finally:
-        p = players.pop(interaction.guild.id, None)
+        try:
+            _players_lock.acquire()
+            p = players.pop(interaction.guild.id, None)
+        finally:
+            try:
+                _players_lock.release()
+            except Exception:
+                pass
         if p:
             p.destroy()
     await interaction.response.send_message("Mình đã rời kênh thoại, hẹn gặp lại :3")
