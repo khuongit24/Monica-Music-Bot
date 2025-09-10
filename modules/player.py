@@ -41,9 +41,11 @@ class MusicPlayer:
         self.loop_one: bool = False
         self.history: deque[Dict[str, Any]] = deque(maxlen=200)
         self._suppress_loop_requeue_once: bool = False
+        # Capture the running event loop at construction time for thread-safe callbacks
         try:
-            self._loop = getattr(self.bot, "loop", None) or asyncio.get_running_loop()
+            self._loop = asyncio.get_running_loop()
         except RuntimeError:
+            # Fallback: no running loop at construction (should be rare); will rely on bot internals later
             self._loop = None
         try:
             if self._loop:
@@ -174,6 +176,18 @@ class MusicPlayer:
                 self._last_active = time.time(); self._idle_warned = False
             except Exception:
                 logger.debug("add_track: failed updating activity timestamps", exc_info=True)
+        # After enqueue, refresh controls so buttons (Skip/Queue) are enabled
+        try:
+            if self.now_message is not None:
+                from modules.ui_components import MusicControls as _Controls
+                _view = _Controls(self.guild.id)
+                _msg = await self.now_message.edit(view=_view)
+                try:
+                    _view.message = _msg
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     async def clear_all(self):
         async with self._lock:
@@ -452,12 +466,28 @@ class MusicPlayer:
                             logger.info("Finish playback guild=%s title=%s elapsed=%.2fs", self.guild.id, truncate(data.get("title"), 80), elapsed)
                         except Exception: pass
                         metric_inc("playback_finish")
+                    # Thread-safe notify of next_event; use captured loop or Discord connection loop
                     try:
-                        try: self._loop.call_soon_threadsafe(self.next_event.set)
-                        except Exception:
-                            try: asyncio.get_event_loop().call_soon_threadsafe(self.next_event.set)
-                            except Exception: logger.exception("Failed to set next event (double fallback)")
-                    except Exception: logger.exception("Failed in _after callback")
+                        loop = self._loop
+                        if loop:
+                            loop.call_soon_threadsafe(self.next_event.set)
+                            return
+                    except Exception:
+                        pass
+                    # Fallback: try bot connection loop (discord.py internal)
+                    try:
+                        conn = getattr(self.bot, "_connection", None)
+                        loop2 = getattr(conn, "loop", None)
+                        if loop2:
+                            loop2.call_soon_threadsafe(self.next_event.set)
+                            return
+                    except Exception:
+                        pass
+                    # Final fallback: attempt policy loop
+                    try:
+                        asyncio.get_event_loop_policy().get_event_loop().call_soon_threadsafe(self.next_event.set)
+                    except Exception:
+                        logger.exception("Failed to set next event (all fallbacks)")
                 async with self._lock:
                     try:
                         # Optional tiny preroll: schedule play on next loop cycle to let FFmpeg warm up I/O buffers.

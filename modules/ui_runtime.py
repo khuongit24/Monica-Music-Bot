@@ -58,7 +58,13 @@ def start_now_updater(player: Any, started_at: float, duration: Optional[float],
                     elapsed = time.time() - started_at
                     bar = make_progress_bar(elapsed, duration)
                     embed = build_now_embed(player.current, extra_desc=bar, stream_profile=stream_profile)
-                    await player.now_message.edit(embed=embed, view=_Controls(player.guild.id))
+                    view = _Controls(player.guild.id)
+                    msg = await player.now_message.edit(embed=embed, view=view)
+                    try:
+                        # Bind message back so view can self-renew on timeout
+                        view.message = msg
+                    except Exception:
+                        pass
                 except discord.HTTPException:
                     pass
                 await asyncio.sleep(interval)

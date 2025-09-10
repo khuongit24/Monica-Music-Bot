@@ -368,12 +368,29 @@ class YTDLTrack:
 # --- Decomposed helper steps (non-invasive; reuses original logic pieces) ---
 async def _execute_with_fallbacks(query: str, timeout: float):
     loop = asyncio.get_running_loop()
+    # Normalize plain-text queries to use yt-dlp default_search prefix to avoid 'not a valid URL' errors
+    try:
+        q = query.strip()
+        is_url = q.startswith("http://") or q.startswith("https://")
+        if not is_url:
+            # Use injected default_search if available; fallback to ytsearch
+            try:
+                ds = (YTDL_OPTS or {}).get("default_search")
+            except Exception:
+                ds = None
+            prefix = (ds or "ytsearch").strip(":")
+            if not q.lower().startswith((prefix + ":")):
+                q = f"{prefix}:{q}"
+        else:
+            q = query
+    except Exception:
+        q = query
     async with DOWNLOAD_SEMAPHORE:
         data = None
         metric_inc("resolve_attempts")
         try:
             start = time.perf_counter()
-            fut_exec = loop.run_in_executor(_YTDL_EXECUTOR, lambda: ytdl.extract_info(query, download=False))
+            fut_exec = loop.run_in_executor(_YTDL_EXECUTOR, lambda: ytdl.extract_info(q, download=False))
             data = await asyncio.wait_for(fut_exec, timeout=timeout)
             metric_add_time("ytdl_primary_time", time.perf_counter() - start)
         except asyncio.TimeoutError:
@@ -403,7 +420,7 @@ async def _execute_with_fallbacks(query: str, timeout: float):
                     except Exception:
                         alt_ytdl = YoutubeDL(alt_opts)
                 start2 = time.perf_counter()
-                fut2 = loop.run_in_executor(_YTDL_EXECUTOR, lambda: alt_ytdl.extract_info(query, download=False))
+                fut2 = loop.run_in_executor(_YTDL_EXECUTOR, lambda: alt_ytdl.extract_info(q, download=False))
                 data = await asyncio.wait_for(fut2, timeout=timeout)
                 metric_add_time("ytdl_fallback_time", time.perf_counter() - start2)
             except asyncio.TimeoutError:
@@ -429,7 +446,7 @@ async def _execute_with_fallbacks(query: str, timeout: float):
                         except Exception:
                             minimal_ytdl = YoutubeDL(minimal_opts)
                     start3 = time.perf_counter()
-                    fut3 = loop.run_in_executor(_YTDL_EXECUTOR, lambda: minimal_ytdl.extract_info(query, download=False))
+                    fut3 = loop.run_in_executor(_YTDL_EXECUTOR, lambda: minimal_ytdl.extract_info(q, download=False))
                     data = await asyncio.wait_for(fut3, timeout=timeout)
                     metric_add_time("ytdl_minimal_time", time.perf_counter() - start3)
                 except Exception:

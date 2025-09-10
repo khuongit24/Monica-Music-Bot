@@ -17,12 +17,14 @@ logger = logging.getLogger("Monica.UIComponents")
 
 
 def _get_runtime():
-    """Lấy players và bot an toàn, tránh import vòng lặp khi chạy dưới __main__.
+    """Lấy players và bot đang chạy từ module thực thi.
 
+    Ưu tiên __main__ (khi chạy `python bot.py`), sau đó mới đến 'bot'.
+    Tránh tình trạng import lại `bot` tạo module song song khiến state bị lệch.
     Trả về (players_dict, bot_obj). Nếu không có thì trả về ({}, None).
     """
     try:
-        mod = sys.modules.get('bot') or sys.modules.get('__main__')
+        mod = sys.modules.get('__main__') or sys.modules.get('bot')
         players = getattr(mod, 'players', {}) if mod else {}
         bot_obj = getattr(mod, 'bot', None) if mod else None
         return players, bot_obj
@@ -39,6 +41,23 @@ class MusicControls(ui.View):
         # Áp dụng trạng thái nút theo bối cảnh ngay khi tạo
         try:
             self._apply_state()
+            # Nếu view đã được gắn vào message sẵn (khi edit), re-apply sau 1 tick để chắc chắn
+            async def _reapply_later():
+                try:
+                    await discord.utils.sleep_until(discord.utils.utcnow())  # schedule next loop tick
+                    self._apply_state()
+                    if getattr(self, 'message', None):
+                        try:
+                            await self.message.edit(view=self)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            try:
+                import asyncio as _aio
+                _aio.create_task(_reapply_later())
+            except Exception:
+                pass
         except Exception:
             # Không làm gián đoạn nếu Discord internals thay đổi
             logger.debug("MusicControls: apply_state failed on init", exc_info=True)
@@ -124,14 +143,19 @@ class MusicControls(ui.View):
 
             # Xác định trạng thái phát theo 2 nguồn: VoiceClient và player.current để tránh trạng thái trễ
             vc_play = bool(vc and (getattr(vc, 'is_playing', lambda: False)() or getattr(vc, 'is_paused', lambda: False)()))
+            # consider "playing" if we have a current track or voice is playing/paused
             pl_play = bool(player and getattr(player, 'current', None))
-            is_playing = vc_play or pl_play
+            is_playing = bool(vc_play or pl_play)
             # Tránh false-negative: ưu tiên qsize() nếu có
             try:
                 has_queue = bool(player and getattr(player, 'queue', None) and player.queue.qsize() > 0)
             except Exception:
                 has_queue = bool(getattr(player, 'queue', None) and not player.queue.empty())
-            has_history = bool(player and getattr(player, 'history', None))
+            # history viewable if deque has at least 1 item
+            try:
+                has_history = bool(player and getattr(player, 'history', None) and len(player.history) > 0)
+            except Exception:
+                has_history = bool(player and getattr(player, 'history', None))
 
             # Tìm các nút theo label hoặc emoji
             btn_skip = None; btn_stop = None; btn_rev = None; btn_queue = None
@@ -146,12 +170,16 @@ class MusicControls(ui.View):
                     elif item.label == "Hàng đợi" or item.emoji == "📜":
                         btn_queue = item
 
+            # Skip: enable if something is playing and there is a next item
             if btn_skip:
                 btn_skip.disabled = not (is_playing and has_queue)
+            # Stop: enable if voice is playing or paused, or player claims current
             if btn_stop:
                 btn_stop.disabled = not is_playing
+            # Reverse: enable if we have any history
             if btn_rev:
                 btn_rev.disabled = not has_history
+            # Queue: enable if queue has items (even if not playing yet)
             if btn_queue:
                 btn_queue.disabled = not has_queue
         except Exception:
