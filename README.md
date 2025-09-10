@@ -1,4 +1,4 @@
-# Monica Discord Music Bot v3.9.4
+# Monica Discord Music Bot
 
 Đây là một dự án bot nhạc cho Discord được phát triển **dành cho mục đích sử dụng cá nhân và nghiên cứu**.
 
