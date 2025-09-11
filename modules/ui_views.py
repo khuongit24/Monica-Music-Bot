@@ -11,6 +11,8 @@ from modules.ui_components import (
     QueuePaginatorView,
     create_help_embed,
     create_now_playing_embed,
+    build_search_list_embed,
+    SelectSearchResultView,
 )
 
 __all__ = [
@@ -20,4 +22,6 @@ __all__ = [
     "QueuePaginatorView",
     "create_help_embed",
     "create_now_playing_embed",
+    "build_search_list_embed",
+    "SelectSearchResultView",
 ]

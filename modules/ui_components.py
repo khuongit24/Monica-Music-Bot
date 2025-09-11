@@ -785,3 +785,86 @@ def create_error_embed(message: str, title: str = "❌ Lỗi") -> discord.Embed:
         description=message,
         color=ERR_COLOR
     )
+
+
+# =============================
+# Search result selection (Top-N dropdown)
+# =============================
+
+def build_search_list_embed(results: list[dict], *, query: str, limit: int = 3) -> discord.Embed:
+    """Build an embed listing top-N search results for selection.
+
+    Each line shows index, truncated title, uploader, and formatted duration.
+    """
+    shown = results[: max(1, int(limit))]
+    lines = []
+    for i, e in enumerate(shown, start=1):
+        title = truncate(e.get("title") or "Unknown", 60)
+        artist = truncate(e.get("uploader") or e.get("channel") or "Unknown", 36)
+        dur = format_duration(e.get("duration"))
+        lines.append(f"{i}. {title} — {artist} — {dur}")
+    desc = "\n".join(lines) if lines else "Không có kết quả"
+    embed = discord.Embed(
+        title="🔎 Kết quả tìm kiếm (chọn 1)",
+        description=desc,
+        color=THEME_COLOR,
+    )
+    if results and results[0].get("thumbnail"):
+        try:
+            embed.set_thumbnail(url=results[0]["thumbnail"])  # best-effort
+        except Exception:
+            pass
+    embed.set_footer(text="Tự động chọn #1 sau 20s nếu bạn không chọn")
+    try:
+        embed.add_field(name="Từ khóa", value=truncate(query, 80), inline=False)
+    except Exception:
+        pass
+    return embed
+
+
+class SelectSearchResultView(ui.View):
+    """Dropdown view for selecting one result among top-N candidates.
+
+    Owner-only interactions; auto-timeout policy is handled by the caller
+    (we expose chosen state and let caller act on timeout to avoid implicit
+    side-effects inside View lifecycle).
+    """
+
+    def __init__(self, *, owner_id: int, guild_id: int, results: list[dict], query: str, timeout: float = 20.0):
+        super().__init__(timeout=timeout)
+        self.owner_id = int(owner_id)
+        self.guild_id = int(guild_id)
+        self.results = list(results)
+        self.query = query
+        self.chosen_entry: dict | None = None
+        # Build options (<=25 by Discord constraints)
+        options: list[discord.SelectOption] = []
+        for idx, e in enumerate(self.results[:25]):
+            label = truncate(e.get("title") or "Unknown", 90)
+            meta = (e.get("uploader") or e.get("channel") or "").strip()
+            dur_s = format_duration(e.get("duration"))
+            desc = truncate(f"{meta} • {dur_s}" if meta else dur_s, 100)
+            options.append(discord.SelectOption(label=label, value=str(idx), description=desc))
+        select = ui.Select(placeholder="Chọn bài để phát", min_values=1, max_values=1, options=options)
+        async def _callback(interaction: discord.Interaction):
+            if interaction.user.id != self.owner_id:
+                await interaction.response.send_message("Bạn không phải người đã gọi lệnh này.", ephemeral=True)
+                return
+            try:
+                choice_idx = int(select.values[0])
+            except Exception:
+                await interaction.response.send_message("Lựa chọn không hợp lệ", ephemeral=True)
+                return
+            self.chosen_entry = self.results[choice_idx]
+            # Disable after selection for UX
+            select.disabled = True
+            try:
+                await interaction.response.edit_message(view=self)
+            except Exception:
+                try:
+                    await interaction.edit_original_response(view=self)
+                except Exception:
+                    pass
+        select.callback = _callback  # type: ignore[assignment]
+        self.add_item(select)
+

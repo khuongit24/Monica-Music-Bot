@@ -66,6 +66,25 @@ def register_hook(name: str, func):
     lst.append(func)
 
 
+def _freeze_opts(obj):
+    """Recursively convert yt-dlp options into a hashable, stable structure.
+    - dict -> tuple of (key, frozen(value)) sorted by key
+    - list/tuple -> tuple of frozen items
+    - set -> tuple of sorted frozen items
+    - other -> as-is
+    """
+    try:
+        if isinstance(obj, dict):
+            return tuple((k, _freeze_opts(v)) for k, v in sorted(obj.items(), key=lambda x: str(x[0])))
+        if isinstance(obj, (list, tuple)):
+            return tuple(_freeze_opts(v) for v in obj)
+        if isinstance(obj, set):
+            return tuple(sorted((_freeze_opts(v) for v in obj), key=lambda x: str(x)))
+    except Exception:
+        pass
+    return obj
+
+
 def _safe_set_future_result(fut, result):
     try:
         if fut and not fut.done():
@@ -411,7 +430,7 @@ async def _execute_with_fallbacks(query: str, timeout: float):
                 # cache alt ytdl instances keyed by frozenset of option items
                 if not hasattr(_execute_with_fallbacks, "_ytdl_cache"):
                     _execute_with_fallbacks._ytdl_cache = {}
-                k = tuple(sorted(alt_opts.items()))
+                k = _freeze_opts(alt_opts)
                 alt_ytdl = _execute_with_fallbacks._ytdl_cache.get(k)
                 if alt_ytdl is None:
                     try:
@@ -437,7 +456,7 @@ async def _execute_with_fallbacks(query: str, timeout: float):
                     minimal_opts["noplaylist"] = True
                     from yt_dlp import YoutubeDL
                     # reuse minimal ytdl instance if cached
-                    k2 = tuple(sorted(minimal_opts.items()))
+                    k2 = _freeze_opts(minimal_opts)
                     minimal_ytdl = _execute_with_fallbacks._ytdl_cache.get(k2)
                     if minimal_ytdl is None:
                         try:
@@ -507,3 +526,135 @@ def _finalize_and_pick_url(data: dict) -> dict:
     if not data.get("url"):
         raise RuntimeError("Không lấy được stream URL từ nguồn")
     return data
+
+
+async def search_entries(query: str, limit: int = 3, timeout: float = 15.0) -> list[dict]:
+    """Search for multiple candidates without collapsing to the first entry.
+
+    This function intentionally bypasses the global `noplaylist=True` behavior
+    used for single-result resolve, by spawning a YoutubeDL instance with
+    `noplaylist=False` and `default_search=ytsearch{limit}`. It still honors
+    the same concurrency constraints via semaphores and thread-pool executor.
+
+    Args:
+        query: User query (URL or keyword). For keywords, this will trigger a
+               yt-dlp search returning up to `limit` entries.
+        limit: Max number of candidates to return (default 3, clamped to [1,25]).
+        timeout: Per-attempt timeout; one fallback attempt is also tried.
+
+    Returns:
+        Up to `limit` raw entry dicts (not finalized with 'url'). If yt-dlp
+        returns a single item, the list contains that item.
+    """
+    import math
+    loop = asyncio.get_running_loop()
+    lim = max(1, min(25, int(limit)))
+    q = (query or "").strip()
+    is_url = q.startswith("http://") or q.startswith("https://")
+    # Build a search-prefixed query that asks yt-dlp to return N entries
+    if not is_url:
+        prefix = f"ytsearch{lim}"
+        # If user already provided a ytsearch-like prefix, respect it
+        lower = q.lower()
+        if not (lower.startswith("ytsearch:") or lower.startswith("ytsearch") or lower.startswith("gvsearch:")):
+            q = f"{prefix}:{q}"
+    # Compose custom options allowing playlists (to return multiple entries)
+    base_opts = dict(YTDL_OPTS or {})
+    base_opts["noplaylist"] = False
+    # Reduce retries to avoid long stalls; search phase should be snappy
+    base_opts["retries"] = min(1, int(base_opts.get("retries", 1) or 1))
+    base_opts["extractor_retries"] = min(1, int(base_opts.get("extractor_retries", 1) or 1))
+    # Ensure default_search matches our intended prefix family
+    base_opts["default_search"] = f"ytsearch{lim}"
+    try:
+        from yt_dlp import YoutubeDL
+    except Exception:
+        raise RuntimeError("yt-dlp không khả dụng")
+
+    # Cache custom ytdl instances keyed by option set (function attribute cache)
+    if not hasattr(search_entries, "_ytdl_cache"):
+        search_entries._ytdl_cache = {}
+    k = _freeze_opts(base_opts)
+    ydl = search_entries._ytdl_cache.get(k)
+    if ydl is None:
+        try:
+            ydl = YoutubeDL(base_opts)
+            search_entries._ytdl_cache[k] = ydl
+        except Exception:
+            ydl = YoutubeDL(base_opts)
+
+    # Throttle: use RESOLVE_SEMAPHORE if provided (owner-level limit), and always
+    # guard the extract with DOWNLOAD_SEMAPHORE to limit concurrent extractor runs.
+    async def _extract(_ydl, _q):
+        fut = loop.run_in_executor(_YTDL_EXECUTOR, lambda: _ydl.extract_info(_q, download=False))
+        return await asyncio.wait_for(fut, timeout=timeout)
+
+    data = None
+    try:
+        try:
+            metric_inc("resolve_attempts")
+        except Exception:
+            pass
+        if RESOLVE_SEMAPHORE is not None:
+            async with RESOLVE_SEMAPHORE:
+                async with DOWNLOAD_SEMAPHORE:
+                    data = await _extract(ydl, q)
+        else:
+            async with DOWNLOAD_SEMAPHORE:
+                data = await _extract(ydl, q)
+    except asyncio.TimeoutError:
+        logger.warning("yt-dlp search timeout for query=%s", _truncate_query(query))
+        metric_inc("ytdl_timeout")
+        raise RuntimeError("Tìm kiếm quá lâu, thử lại sau")
+    except Exception as e:
+        # Fallback: relax format constraints
+        try:
+            metric_inc("ytdl_error")
+        except Exception:
+            pass
+        try:
+            alt_opts = dict(base_opts)
+            alt_opts.pop("format", None)
+            k2 = _freeze_opts(alt_opts)
+            ydl2 = search_entries._ytdl_cache.get(k2)
+            if ydl2 is None:
+                ydl2 = YoutubeDL(alt_opts)
+                search_entries._ytdl_cache[k2] = ydl2
+            if RESOLVE_SEMAPHORE is not None:
+                async with RESOLVE_SEMAPHORE:
+                    async with DOWNLOAD_SEMAPHORE:
+                        data = await _extract(ydl2, q)
+            else:
+                async with DOWNLOAD_SEMAPHORE:
+                    data = await _extract(ydl2, q)
+        except Exception:
+            logger.debug("yt-dlp search final fallback failed", exc_info=True)
+            raise RuntimeError("Không thể lấy danh sách kết quả tìm kiếm")
+
+    # Normalize into entries list
+    if isinstance(data, dict) and "entries" in data:
+        entries = [e for e in (data.get("entries") or []) if e]
+        if not entries:
+            raise RuntimeError("Không tìm thấy mục trong kết quả")
+        # Prefer video-like entries to avoid playlists/tabs in selection
+        def _is_video_like(e: dict) -> bool:
+            try:
+                t = (e.get("_type") or "").lower()
+                if t in {"playlist", "multi_video"}:
+                    return False
+                ie = (e.get("ie_key") or "").lower()
+                if ie in {"youtubetab", "youtubeplaylist"}:
+                    return False
+                url = (e.get("url") or e.get("webpage_url") or "").lower()
+                if ("watch?v=" in url) or ("youtu.be/" in url):
+                    return True
+                # duration presence is also a good hint for single video
+                if e.get("duration"):
+                    return True
+            except Exception:
+                pass
+            return True  # default permissive
+        vids = [e for e in entries if _is_video_like(e)]
+        chosen = vids if vids else entries
+        return chosen[:lim]
+    return [data]

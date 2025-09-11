@@ -968,6 +968,150 @@ async def handle_play_request(ctx_or_interaction, query: str):
             pass
         return
 
+    # Branch: keyword queries → present top-3 and let user choose via dropdown
+    is_keyword = not is_url
+    if is_keyword:
+        # Use new multi-result search to build a selection UI
+        try:
+            from modules.ytdl_track import search_entries as _search_entries
+            candidates = await _search_entries(query, limit=3, timeout=15.0)
+        except Exception as e:
+            logger.exception("Search list failed: %s", e)
+            try:
+                from modules.ui_components import create_error_embed as _err
+            except Exception:
+                _err = None
+            if ack_msg is not None:
+                if _err:
+                    await ack_msg.edit(content=None, embed=_err(str(e), title="❌ Lỗi khi tìm kiếm"))
+                else:
+                    await ack_msg.edit(content=None, embed=discord.Embed(title="❌ Lỗi khi tìm kiếm", description=str(e), color=ERR_COLOR))
+            else:
+                if isinstance(ctx_or_interaction, discord.Interaction):
+                    await ctx_or_interaction.response.send_message(f"Lỗi khi tìm kiếm: {e}", ephemeral=True)
+                else:
+                    await ctx_or_interaction.send(f"Lỗi khi tìm kiếm: {e}")
+            return
+        # Build and send selection UI
+        try:
+            from modules.ui_components import build_search_list_embed as _build_list, SelectSearchResultView as _SelectView
+        except Exception:
+            _build_list = None; _SelectView = None
+        if not candidates:
+            try:
+                if ack_msg is not None:
+                    await ack_msg.edit(content="❌ Không tìm thấy kết quả phù hợp")
+                else:
+                    if isinstance(ctx_or_interaction, discord.Interaction):
+                        await ctx_or_interaction.response.send_message("❌ Không tìm thấy kết quả phù hợp", ephemeral=True)
+                    else:
+                        await ctx_or_interaction.send("❌ Không tìm thấy kết quả phù hợp")
+            except Exception:
+                pass
+            return
+        # Send list + view
+        view = None
+        try:
+            if _build_list and _SelectView:
+                embed = _build_list(candidates, query=query, limit=3)
+                owner = getattr(user, 'id', 0) or 0
+                gid = getattr(guild, 'id', 0) or 0
+                view = _SelectView(owner_id=owner, guild_id=gid, results=candidates, query=query, timeout=20.0)
+                if ack_msg is not None:
+                    try:
+                        await ack_msg.edit(embed=embed, view=view)
+                    except Exception:
+                        if isinstance(ctx_or_interaction, discord.Interaction):
+                            ack_msg = await ctx_or_interaction.followup.send(embed=embed, view=view)
+                        else:
+                            ack_msg = await ctx_or_interaction.send(embed=embed, view=view)
+                else:
+                    if isinstance(ctx_or_interaction, discord.Interaction):
+                        try:
+                            ack_msg = await ctx_or_interaction.followup.send(embed=embed, view=view)
+                        except Exception:
+                            try:
+                                await ctx_or_interaction.edit_original_response(embed=embed, view=view)
+                            except Exception:
+                                ack_msg = await ctx_or_interaction.response.send_message(embed=embed, view=view)
+                    else:
+                        ack_msg = await ctx_or_interaction.send(embed=embed, view=view)
+        except Exception:
+            logger.debug("Failed to present selection UI", exc_info=True)
+        # Wait for selection or timeout
+        # We poll the view state for up to 20s; if nothing chosen, pick first
+        chosen = None
+        try:
+            import asyncio as _aio
+            for _ in range(20):
+                await _aio.sleep(1)
+                if view and getattr(view, 'chosen_entry', None):
+                    chosen = view.chosen_entry
+                    break
+            if chosen is None:
+                # Default to first candidate
+                chosen = candidates[0]
+        except Exception:
+            chosen = candidates[0]
+        # Construct minimal data dict for enqueue; defer final URL pick to playback pipeline
+        data = {
+            "title": chosen.get("title"),
+            "webpage_url": chosen.get("webpage_url") or chosen.get("original_url") or chosen.get("url"),
+            "thumbnail": chosen.get("thumbnail"),
+            "uploader": chosen.get("uploader") or chosen.get("channel"),
+            "duration": chosen.get("duration"),
+            "is_live": bool(chosen.get("is_live")),
+            "query": query,
+        }
+        data["requested_by"] = getattr(user, 'display_name', str(user))
+        try:
+            if getattr(user, 'id', None) is not None:
+                data["requested_by_id"] = int(user.id)
+        except Exception:
+            pass
+        try:
+            data.setdefault("_enqueued_at", time.time())
+        except Exception:
+            pass
+        try:
+            await player.add_track(data)
+            metric_inc("queue_add")
+        except Exception as e:
+            logger.exception("Add track failed: %s", e)
+            try:
+                from modules.ui_components import create_error_embed as _err
+            except Exception:
+                _err = None
+            if ack_msg is not None:
+                if _err:
+                    await ack_msg.edit(content=None, embed=_err(str(e), title="❌ Không thể thêm vào hàng đợi"), view=None)
+                else:
+                    await ack_msg.edit(content=None, embed=discord.Embed(title="❌ Không thể thêm vào hàng đợi", description=str(e), color=ERR_COLOR), view=None)
+            else:
+                if isinstance(ctx_or_interaction, discord.Interaction):
+                    await ctx_or_interaction.response.send_message(str(e), ephemeral=True)
+                else:
+                    await ctx_or_interaction.send(str(e))
+            return
+        # Acknowledge selection/enqueue
+        try:
+            from modules.ui_components import create_queue_add_embed as _qadd
+        except Exception:
+            _qadd = None
+        try:
+            embed = _qadd(data) if _qadd else discord.Embed(title="✅ Đã thêm vào hàng đợi", description=truncate(data.get("title") or "Đã thêm vào hàng đợi", 80), color=OK_COLOR)
+            if ack_msg is not None:
+                await ack_msg.edit(embed=embed, view=None)
+            else:
+                if isinstance(ctx_or_interaction, discord.Interaction):
+                    await ctx_or_interaction.followup.send(embed=embed)
+                else:
+                    await ctx_or_interaction.send(embed=embed)
+        except Exception:
+            pass
+        return
+
+    # URL or explicit path → old single-result flow
     try:
         track = await YTDLTrack.resolve(query)
     except Exception as e:
