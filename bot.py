@@ -70,7 +70,7 @@ IDLE_DISCONNECT_SECONDS: int = int(CONFIG.get("idle_disconnect_seconds", 900))
 # streaming profile and now-playing update interval
 STREAM_PROFILE: str = str(CONFIG.get("stream_profile", "stable")).lower().strip() or "stable"
 NOW_UPDATE_INTERVAL: int = max(5, int(CONFIG.get("now_update_interval_seconds", 12)))
-VERSION: str = "v3.9.5" 
+VERSION: str = "v3.10.5" 
 GIT_COMMIT: Optional[str] = os.getenv("GIT_COMMIT") or os.getenv("COMMIT_SHA") or None
 
 # Playbook modes & Spotify removed. Supported sources only.
