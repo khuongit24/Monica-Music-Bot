@@ -53,7 +53,7 @@ Phát nhạc:
 
 1. Tải về file zip của bot
 2. Cài đặt phụ thuộc: `pip install -r requirements.txt`.
-3. Cấu hình cài token discord application của bạn trong config.json
+3. Cấu hình cài token discord application của bạn trong .env
 4. Mở terminal và cd sang thư mục chứa bot. Ví dụ cd D:\Monica_Bot
 4. Gõ lệnh chạy bot: `python bot.py`.
 
