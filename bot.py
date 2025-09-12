@@ -70,7 +70,7 @@ IDLE_DISCONNECT_SECONDS: int = int(CONFIG.get("idle_disconnect_seconds", 900))
 # streaming profile and now-playing update interval
 STREAM_PROFILE: str = str(CONFIG.get("stream_profile", "stable")).lower().strip() or "stable"
 NOW_UPDATE_INTERVAL: int = max(5, int(CONFIG.get("now_update_interval_seconds", 12)))
-VERSION: str = "v3.10.0" 
+VERSION: str = "v3.10.4" 
 GIT_COMMIT: Optional[str] = os.getenv("GIT_COMMIT") or os.getenv("COMMIT_SHA") or None
 
 # Playbook modes & Spotify removed. Supported sources only.
@@ -577,6 +577,74 @@ players: Dict[int, MusicPlayer] = {}
 # Protect cross-thread access to the players dict (control server may run in plain threads)
 _players_lock = threading.RLock()
 
+# --- P2/P3 feature toggles & runtime state ---
+INTERACTIVE_SEARCH_ENABLED: bool = True  # may be disabled in degradation
+_DEGRADE_STATE: str = "normal"  # normal | reduced_interactive | url_only
+_DEGRADE_LAST_EVAL: float = 0.0
+_DEGRADE_HYSTERESIS_SECONDS: int = 60
+_PLAY_REQUEST_BUFFER: Dict[int, list[tuple[float, str, Any]]] = {}
+_PLAY_COALESCE_WINDOW: float = 2.5
+_PLAY_COALESCE_MAX: int = 5
+_QUEUE_GAUGE_INTERVAL: float = 15.0
+
+def evaluate_degradation() -> None:
+    """Evaluate degradation ladder based on snapshot metrics (P2)."""
+    global INTERACTIVE_SEARCH_ENABLED, _DEGRADE_STATE, _DEGRADE_LAST_EVAL
+    try:
+        now = time.time()
+        if now - _DEGRADE_LAST_EVAL < 10:
+            return
+        _DEGRADE_LAST_EVAL = now
+        snap = metrics_snapshot()
+        presented = snap.get("search_presented", 0) or 0
+        timeouts = snap.get("search_timeout", 0) or 0
+        fails = snap.get("resolve_fail", 0) or 0
+        attempts = snap.get("resolve_attempts", 0) or 0
+        fail_rate = (fails / attempts) if attempts else 0.0
+        timeout_rate = (timeouts / presented) if presented else 0.0
+        new_state = _DEGRADE_STATE
+        if fail_rate > 0.35 or timeout_rate > 0.5:
+            new_state = "url_only"
+        elif fail_rate > 0.2 or timeout_rate > 0.35:
+            new_state = "reduced_interactive"
+        else:
+            new_state = "normal"
+        if new_state != _DEGRADE_STATE:
+            _DEGRADE_STATE = new_state
+            INTERACTIVE_SEARCH_ENABLED = new_state != "url_only"
+            metric_inc("playback_start", 0)  # ensure metrics module imported
+            try:
+                from modules.metrics import set_gauge as _set_g
+                _set_g("circuit_state", 1 if new_state != "normal" else 0)
+            except Exception:
+                pass
+            logger.warning("Degradation state changed -> %s", new_state)
+    except Exception:
+        logger.debug("evaluate_degradation failed", exc_info=True)
+
+async def _queue_length_gauge_loop():
+    from modules.metrics import set_gauge as _set_g
+    while True:
+        try:
+            await asyncio.sleep(_QUEUE_GAUGE_INTERVAL)
+            total = 0
+            _players_lock.acquire()
+            try:
+                for p in players.values():
+                    try:
+                        total += p.queue.qsize()
+                    except Exception:
+                        pass
+            finally:
+                try: _players_lock.release()
+                except Exception: pass
+            _set_g("queue_length_active", total)
+            evaluate_degradation()
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logger.debug("queue gauge loop error", exc_info=True)
+
 def get_player_for_ctx(guild: discord.Guild, text_channel: discord.TextChannel) -> MusicPlayer:
     """Get or create a music player for the given guild and text channel.
     
@@ -596,7 +664,39 @@ def get_player_for_ctx(guild: discord.Guild, text_channel: discord.TextChannel) 
     _players_lock.acquire()
     try:
         player = players.get(guild.id)
-        if not player:
+        # If a player exists but its internal loop task is finished, recreate and transfer state
+        if player and getattr(player, '_task', None) is not None and getattr(player._task, 'done', lambda: False)():
+            try:
+                logger.info("Recreating player for guild=%s because previous loop finished", guild.id)
+            except Exception:
+                pass
+            try:
+                old = player
+                # create new player and transfer queue + vc if possible
+                player = MusicPlayer(guild=guild, text_channel=text_channel)
+                try:
+                    # transfer queue object
+                    if getattr(old, 'queue', None) is not None:
+                        player.queue = old.queue
+                except Exception:
+                    pass
+                try:
+                    if getattr(old, 'vc', None) is not None:
+                        player.vc = old.vc
+                except Exception:
+                    pass
+                players[guild.id] = player
+                try:
+                    # try best-effort to mark old as destroyed
+                    if hasattr(old, 'destroy'):
+                        old.destroy()
+                except Exception:
+                    pass
+            except Exception:
+                # fallback to creating a fresh player if transfer fails
+                player = MusicPlayer(guild=guild, text_channel=text_channel)
+                players[guild.id] = player
+        elif not player:
             player = MusicPlayer(guild=guild, text_channel=text_channel)
             players[guild.id] = player
         return player
@@ -735,6 +835,12 @@ async def on_ready():
         await bot.change_presence(activity=discord.Game(name="/play hoặc /help để bắt đầu ✨"))
     except Exception:
         pass
+    try:
+        # Start queue length gauge + degradation evaluator loop (P2)
+        asyncio.create_task(_queue_length_gauge_loop())
+        logger.info("Started queue length gauge loop")
+    except Exception:
+        logger.debug("Failed to start queue gauge loop", exc_info=True)
     # Optional services (queue persistence & Prometheus exporter)
     try:
         if CONFIG.get("queue_persistence_enabled"):
@@ -798,40 +904,71 @@ async def on_ready():
 
 @bot.event
 async def on_voice_state_update(member: discord.Member, before, after):
+    # In test environments bot.user may be None; guard access
+    if not getattr(bot, 'user', None):
+        return
     if member.id != bot.user.id:
         return
-    # Disconnected from a voice channel
+    # Disconnected from a voice channel (P2: add grace + metrics)
     if before.channel and not after.channel:
         player = players.get(before.channel.guild.id)
+        from modules.metrics import metric_inc as _minc
         if player and player.queue and not player.queue.empty():
-            # Attempt auto-reconnect if there is still a queue
-            try:
-                dest = None
-                # try to find any non-empty voice channel where recent requester is
-                if player.current and (player.current.get('requested_by_id') or player.current.get('requested_by')):
-                    uid = player.current.get('requested_by_id') or player.current.get('requested_by')
-                    g = before.channel.guild
-                    for ch in g.voice_channels:
-                        for m in ch.members:
-                            if m.id == uid:
-                                dest = ch; break
-                        if dest:
-                            break
-                if not dest:
-                    # fallback: previous channel
-                    dest = before.channel
-                if dest:
-                    vc = await dest.connect(timeout=10, reconnect=True)
-                    player.vc = vc
-                    logger.info("Auto reconnected to voice channel guild=%s channel=%s", before.channel.guild.id, dest.id)
+            # Attempt auto-reconnect if there is still a queue (grace period: 5s)
+            async def _attempt_reconnect(p: MusicPlayer, prev_channel):
+                await asyncio.sleep(1.0)  # small delay to allow transient VoiceServerUpdate
+                try:
+                    dest = None
+                    if p.current and (p.current.get('requested_by_id') or p.current.get('requested_by')):
+                        uid = p.current.get('requested_by_id') or p.current.get('requested_by')
+                        g = prev_channel.guild
+                        for ch in g.voice_channels:
+                            for m in ch.members:
+                                if m.id == uid:
+                                    dest = ch; break
+                            if dest:
+                                break
+                    if not dest:
+                        dest = prev_channel
+                    if dest:
+                        _minc("voice_reconnect_attempt")
+                        vc = await dest.connect(timeout=10, reconnect=True)
+                        p.vc = vc
+                        _minc("voice_reconnect_success")
+                        logger.info("Auto reconnected to voice channel guild=%s channel=%s", prev_channel.guild.id, dest.id)
+                        try:
+                            await p.text_channel.send("Mình bị rớt khỏi kênh thoại và đã tự vào lại ✨")
+                        except Exception:
+                            pass
+                        return True
+                except Exception:
+                    logger.debug("Voice reconnect attempt failed", exc_info=True)
+                return False
+            # Schedule grace destroy: wait up to 5s for reconnect
+            async def _grace_destroy(p: MusicPlayer, prev_channel):
+                deadline = time.time() + 5.0
+                success = False
+                while time.time() < deadline and not success:
+                    success = await _attempt_reconnect(p, prev_channel)
+                    if success:
+                        return
+                    await asyncio.sleep(1.0)
+                if not success:
                     try:
-                        await player.text_channel.send("Mình bị rớt khỏi kênh thoại và đã tự vào lại ✨")
-                    except Exception:
-                        pass
-                    return
+                        _players_lock.acquire()
+                        popped = players.pop(prev_channel.guild.id, None)
+                    finally:
+                        try: _players_lock.release()
+                        except Exception: pass
+                    if popped:
+                        popped.destroy()
+                        logger.info("Player destroyed after grace (no reconnect) guild=%s", prev_channel.guild.id)
+            try:
+                asyncio.create_task(_grace_destroy(player, before.channel))
             except Exception:
-                logger.exception("Auto voice reconnect failed")
-        # If no queue or reconnect failed, destroy player
+                logger.debug("Failed to schedule grace destroy", exc_info=True)
+            return
+        # No queue: immediate destroy
         try:
             _players_lock.acquire()
             player = players.pop(before.channel.guild.id, None)
@@ -842,7 +979,7 @@ async def on_voice_state_update(member: discord.Member, before, after):
                 pass
         if player:
             player.destroy()
-            logger.info("Player destroyed due to bot voice disconnect in guild %s", before.channel.guild.id)
+            logger.info("Player destroyed due to bot voice disconnect (empty queue) guild %s", before.channel.guild.id)
 
 # helper to ensure voice connection when user requests join - now uses modular version
 async def ensure_connected_for_user_wrapper(ctx_or_interaction) -> Optional[discord.VoiceClient]:
@@ -881,6 +1018,68 @@ async def handle_play_request(ctx_or_interaction, query: str):
         except Exception:
             pass
     vc = discord.utils.get(bot.voice_clients, guild=guild)
+    # --- P3 Flood coalescing: buffer rapid play requests per guild ---
+    try:
+        gid = getattr(guild, 'id', None)
+        now_ts = time.time()
+        buf = _PLAY_REQUEST_BUFFER.setdefault(gid, [])
+        # prune expired entries outside window
+        buf[:] = [t for t in buf if (now_ts - t[0]) <= _PLAY_COALESCE_WINDOW]
+        buf.append((now_ts, query, ctx_or_interaction))
+        if len(buf) >= _PLAY_COALESCE_MAX:
+            # mark coalesced metric
+            metric_inc("play_flood_coalesced")
+        # If not yet reached threshold and more than 1 pending within window, delay processing to batch
+        if len(buf) > 1 and (now_ts - buf[0][0]) < _PLAY_COALESCE_WINDOW:
+            # schedule flush at window end if not already scheduled
+            if not any(isinstance(x, tuple) and x[1] == "__flush_task__" for x in buf):
+                async def _flush_batch(gid_local, first_ts):
+                    await asyncio.sleep(max(0.05, _PLAY_COALESCE_WINDOW - (time.time() - first_ts)))
+                    batch = _PLAY_REQUEST_BUFFER.get(gid_local)
+                    if not batch:
+                        return
+                    # Extract unique queries in order (limit 5)
+                    queries = []
+                    ctx_ref = None
+                    for ts, q, ctx_ref in batch:
+                        if q not in queries and isinstance(q, str):
+                            queries.append(q)
+                        if len(queries) >= _PLAY_COALESCE_MAX:
+                            break
+                    _PLAY_REQUEST_BUFFER[gid_local] = []
+                    # Provide summary message
+                    try:
+                        msg_txt = f"⚡ Gộp {len(batch)} yêu cầu gần đây thành {len(queries)} truy vấn." if len(batch) > len(queries) else f"⚡ Gộp {len(batch)} yêu cầu phát."
+                        if isinstance(ctx_ref, discord.Interaction):
+                            if getattr(ctx_ref.response, "is_done", lambda: False)():
+                                await ctx_ref.followup.send(msg_txt, ephemeral=False)
+                            else:
+                                await ctx_ref.response.send_message(msg_txt, ephemeral=False)
+                        else:
+                            await ctx_ref.send(msg_txt)
+                    except Exception:
+                        pass
+                    # Sequentially process each query (recursive call)
+                    for q in queries:
+                        try:
+                            await handle_play_request(ctx_ref, q)
+                        except Exception:
+                            logger.debug("Batch play failed for query=%s", q, exc_info=True)
+                try:
+                    buf.append((now_ts, "__flush_task__", None))
+                    asyncio.create_task(_flush_batch(gid, buf[0][0]))
+                except Exception:
+                    pass
+            return
+        else:
+            # single request or window elapsed -> continue normal processing and clear buffer
+            if len(buf) == 1:
+                pass  # first request, proceed
+            else:
+                # window elapsed - process as normal and clear buffer
+                _PLAY_REQUEST_BUFFER[gid] = []
+    except Exception:
+        logger.debug("Flood coalescing logic error", exc_info=True)
     # Quick ack: let user know we're searching/processing for stability
     ack_msg = None
     try:
@@ -968,19 +1167,98 @@ async def handle_play_request(ctx_or_interaction, query: str):
             pass
         return
 
-    # Branch: keyword queries → present top-3 and let user choose via dropdown
+    # Branch: keyword queries → present top-3 and let user choose via dropdown (if enabled)
     is_keyword = not is_url
-    if is_keyword:
+    # Evaluate degradation periodically (lightweight)
+    try:
+        evaluate_degradation()
+    except Exception:
+        pass
+    if is_keyword and INTERACTIVE_SEARCH_ENABLED and _DEGRADE_STATE != "url_only":
         # Use new multi-result search to build a selection UI
         try:
             from modules.ytdl_track import search_entries as _search_entries
-            candidates = await _search_entries(query, limit=3, timeout=15.0)
+            # Adaptive timeout: use timeout streak gauges if present
+            adaptive_timeout = 15.0
+            try:
+                se_func = getattr(sys.modules.get('modules.ytdl_track'), 'search_entries')
+                streak = getattr(se_func, '_timeout_streak', 0)
+                if streak >= 5:
+                    adaptive_timeout = 5.0
+                elif streak >= 3:
+                    adaptive_timeout = 8.0
+            except Exception:
+                pass
+            candidates = await _search_entries(query, limit=3, timeout=adaptive_timeout)
         except Exception as e:
             logger.exception("Search list failed: %s", e)
             try:
                 from modules.ui_components import create_error_embed as _err
             except Exception:
                 _err = None
+            # Attempt reuse of recent cached search result (best-effort) for user satisfaction
+            reused = False
+            fallback_entry = None
+            try:
+                se_func = getattr(sys.modules.get('modules.ytdl_track'), 'search_entries')
+                # access its _recent_cache for any key containing lowered query prefix (naive fuzzy)
+                rc = getattr(se_func, '_recent_cache', {})
+                if rc:
+                    ql = query.lower()
+                    # pick most recent matching key
+                    best_key = None; best_ts = 0; best_entries = None
+                    for k,(ts, ents) in rc.items():
+                        if ql in k and ents:
+                            if ts > best_ts:
+                                best_ts = ts; best_key = k; best_entries = ents
+                    if best_entries and (time.time()-best_ts)<=30:
+                        fallback_entry = best_entries[0]
+                        reused = True
+            except Exception:
+                pass
+            if reused and fallback_entry:
+                # Inform user about degraded reuse
+                notify_msg = "Tìm kiếm hiện đang tạm thời bị lỗi, mình sẽ phát bài nhạc dựa trên kết quả tìm kiếm gần nhất"  # per requirement
+                try:
+                    if ack_msg is not None:
+                        if _err:
+                            emb = _err(notify_msg, title="⚠️ Chế độ tạm thời")
+                        else:
+                            emb = discord.Embed(title="⚠️ Chế độ tạm thời", description=notify_msg, color=THEME_COLOR)
+                        await ack_msg.edit(content=None, embed=emb, view=None)
+                    else:
+                        if isinstance(ctx_or_interaction, discord.Interaction):
+                            await ctx_or_interaction.response.send_message(notify_msg, ephemeral=False)
+                        else:
+                            await ctx_or_interaction.send(notify_msg)
+                except Exception:
+                    pass
+                # Enqueue single fallback entry
+                try:
+                    data = {
+                        "title": fallback_entry.get("title"),
+                        "webpage_url": fallback_entry.get("webpage_url") or fallback_entry.get("original_url") or fallback_entry.get("url"),
+                        "thumbnail": fallback_entry.get("thumbnail"),
+                        "uploader": fallback_entry.get("uploader") or fallback_entry.get("channel"),
+                        "duration": fallback_entry.get("duration"),
+                        "is_live": bool(fallback_entry.get("is_live")),
+                        "query": query,
+                    }
+                    data["requested_by"] = getattr(user, 'display_name', str(user))
+                    try:
+                        if getattr(user, 'id', None) is not None:
+                            data["requested_by_id"] = int(user.id)
+                    except Exception: pass
+                    data.setdefault("_enqueued_at", time.time())
+                    await player.add_track(data)
+                    metric_inc("queue_add")
+                    from modules.metrics import metric_inc as _mi
+                    try: _mi('search_recent_reuse')
+                    except Exception: pass
+                except Exception:
+                    logger.debug("Failed to enqueue fallback recent entry", exc_info=True)
+                return
+            # Normal error messaging path
             if ack_msg is not None:
                 if _err:
                     await ack_msg.edit(content=None, embed=_err(str(e), title="❌ Lỗi khi tìm kiếm"))
@@ -991,6 +1269,18 @@ async def handle_play_request(ctx_or_interaction, query: str):
                     await ctx_or_interaction.response.send_message(f"Lỗi khi tìm kiếm: {e}", ephemeral=True)
                 else:
                     await ctx_or_interaction.send(f"Lỗi khi tìm kiếm: {e}")
+            # On timeout error escalate degrade state sooner
+            if 'quá lâu' in str(e):
+                try:
+                    from modules.metrics import metric_inc as _mi
+                    _mi('search_timeout')
+                except Exception: pass
+                # Force re-evaluate degradation immediately
+                try:
+                    global _DEGRADE_LAST_EVAL
+                    _DEGRADE_LAST_EVAL = 0
+                    evaluate_degradation()
+                except Exception: pass
             return
         # Build and send selection UI
         try:
@@ -1009,7 +1299,7 @@ async def handle_play_request(ctx_or_interaction, query: str):
             except Exception:
                 pass
             return
-        # Send list + view
+    # Send list + view (only if still interactive mode)
         view = None
         try:
             if _build_list and _SelectView:
@@ -1038,19 +1328,23 @@ async def handle_play_request(ctx_or_interaction, query: str):
                         ack_msg = await ctx_or_interaction.send(embed=embed, view=view)
         except Exception:
             logger.debug("Failed to present selection UI", exc_info=True)
-        # Wait for selection or timeout
-        # We poll the view state for up to 20s; if nothing chosen, pick first
+    # Await selection via future (P0) with timeout; fallback to first candidate
         chosen = None
         try:
             import asyncio as _aio
-            for _ in range(20):
-                await _aio.sleep(1)
-                if view and getattr(view, 'chosen_entry', None):
-                    chosen = view.chosen_entry
-                    break
-            if chosen is None:
-                # Default to first candidate
+            from modules.metrics import metric_inc as _minc
+            _minc("search_presented")
+            selection_timeout = 12.0  # configurable (P0 default)
+            if view and hasattr(view, '_selection_future') and getattr(view, '_selection_future') is not None:
+                try:
+                    chosen = await _aio.wait_for(view._selection_future, timeout=selection_timeout)
+                    if chosen:
+                        _minc("search_selected")
+                except _aio.TimeoutError:
+                    _minc("search_timeout")
+            if not chosen:
                 chosen = candidates[0]
+                _minc("search_fallback")
         except Exception:
             chosen = candidates[0]
         # Construct minimal data dict for enqueue; defer final URL pick to playback pipeline
@@ -1110,6 +1404,62 @@ async def handle_play_request(ctx_or_interaction, query: str):
         except Exception:
             pass
         return
+
+    # If keyword but interactive disabled (degradation) -> attempt best-match single search fallback
+    if is_keyword and (not INTERACTIVE_SEARCH_ENABLED or _DEGRADE_STATE == "url_only"):
+        # degrade path: just take first result silently or with small notice
+        try:
+            from modules.ytdl_track import search_entries as _search_entries
+            candidates = await _search_entries(query, limit=1, timeout=10.0)
+            if not candidates:
+                raise RuntimeError("Không tìm thấy kết quả phù hợp ở chế độ giới hạn. Vui lòng thử URL trực tiếp.")
+            chosen = candidates[0]
+            data = {
+                "title": chosen.get("title"),
+                "webpage_url": chosen.get("webpage_url") or chosen.get("original_url") or chosen.get("url"),
+                "thumbnail": chosen.get("thumbnail"),
+                "uploader": chosen.get("uploader") or chosen.get("channel"),
+                "duration": chosen.get("duration"),
+                "is_live": bool(chosen.get("is_live")),
+                "query": query,
+            }
+            data["requested_by"] = getattr(user, 'display_name', str(user))
+            try:
+                if getattr(user, 'id', None) is not None:
+                    data["requested_by_id"] = int(user.id)
+            except Exception:
+                pass
+            data.setdefault("_enqueued_at", time.time())
+            await player.add_track(data)
+            metric_inc("queue_add")
+            # Notify user minimal (ephemeral when possible)
+            degrade_msg = "Chế độ giản lược: đã tự chọn kết quả phù hợp nhất." if _DEGRADE_STATE != "url_only" else "Chế độ chỉ nhận URL: đã tự chọn kết quả khả dụng nhất."
+            try:
+                from modules.ui_components import create_queue_add_embed as _qadd
+            except Exception:
+                _qadd = None
+            try:
+                embed = _qadd(data) if _qadd else discord.Embed(title="✅ Đã thêm vào hàng đợi", description=truncate(data.get("title") or "Đã thêm vào hàng đợi", 80), color=OK_COLOR)
+                embed.set_footer(text=degrade_msg)
+                if isinstance(ctx_or_interaction, discord.Interaction):
+                    if getattr(ctx_or_interaction.response, "is_done", lambda: False)():
+                        await ctx_or_interaction.followup.send(embed=embed, ephemeral=False)
+                    else:
+                        await ctx_or_interaction.response.send_message(embed=embed, ephemeral=False)
+                else:
+                    await ctx_or_interaction.send(embed=embed)
+            except Exception:
+                pass
+            return
+        except Exception as e:
+            try:
+                if isinstance(ctx_or_interaction, discord.Interaction):
+                    await ctx_or_interaction.response.send_message(f"Lỗi chế độ giản lược: {e}", ephemeral=True)
+                else:
+                    await ctx_or_interaction.send(f"Lỗi chế độ giản lược: {e}")
+            except Exception:
+                pass
+            return
 
     # URL or explicit path → old single-result flow
     try:

@@ -45,7 +45,6 @@ class MusicPlayer:
         try:
             self._loop = asyncio.get_running_loop()
         except RuntimeError:
-            # Fallback: no running loop at construction (should be rare); will rely on bot internals later
             self._loop = None
         try:
             if self._loop:
@@ -62,27 +61,98 @@ class MusicPlayer:
         self.now_update_task: Optional[asyncio.Task] = None
         self._last_active = time.time()
         self._idle_warned = False
-        # Watchdog restart tracking: attempts within window
+        # Version token for now-playing embed updates (P1)
+        self._now_version = 0
+        # Serialized embed update queue (P1)
+        self._embed_update_queue: asyncio.Queue = asyncio.Queue()
+        self._embed_worker_task: Optional[asyncio.Task] = None
+        # Watchdog restart tracking
         self._watchdog_attempts = 0
         self._watchdog_window_start = 0.0
         self._watchdog_max_attempts = 4
         self._watchdog_window_seconds = 60.0
-        # Simple per-guild rate limiter for user-facing messages (token bucket)
+        # Rate limit tokens
         self._msg_tokens = 5
         self._msg_token_last = time.time()
-        self._msg_token_rate = 1  # tokens per 10s
-        # Prefetch task dedupe & global concurrency
+        self._msg_token_rate = 1
+        # Prefetch helpers
         self._prefetch_tasks: Dict[str, asyncio.Task] = {}
         self._prefetch_global_sem = asyncio.Semaphore(3)
         if PREFETCH_NEXT:
             try:
-                # use safe task creation helper to ensure consistent scheduling
                 self.prefetch_task = _safe_create_task(self._prefetch_worker(), loop=self._loop)
             except Exception:
                 try:
                     self.prefetch_task = asyncio.create_task(self._prefetch_worker())
                 except Exception:
                     self.prefetch_task = None
+        try:
+            self._embed_worker_task = asyncio.create_task(self._embed_update_worker())
+        except Exception:
+            self._embed_worker_task = None
+
+    async def _embed_update_worker(self):
+        """Serialize edits to now_message to avoid race & NotFound spam (P1)."""
+        from modules.ui_components import MusicControls as _Controls, create_now_playing_embed
+        while not self._closing:
+            try:
+                payload = await self._embed_update_queue.get()
+                if payload is None:  # shutdown signal
+                    break
+                version, data, started_at, duration = payload
+                if version != self._now_version:
+                    continue  # stale
+                if not self.now_message:
+                    # create new message (ensure progress bar present from first frame)
+                    try:
+                        elapsed0 = time.time() - started_at if started_at else 0.0
+                        bar0 = make_progress_bar(elapsed0, duration) if duration else ("" if data.get("is_live") else None)
+                        embed = create_now_playing_embed(
+                            data,
+                            extra_desc=bar0 if bar0 else None,
+                            stream_profile=STREAM_PROFILE,
+                        )
+                        self.now_message = await self.text_channel.send(embed=embed, view=_Controls(self.guild.id))
+                    except Exception:
+                        continue
+                else:
+                    try:
+                        elapsed = time.time() - started_at if started_at else 0.0
+                        bar = make_progress_bar(elapsed, duration)
+                        embed = create_now_playing_embed(data, extra_desc=bar, stream_profile=STREAM_PROFILE)
+                        await self.now_message.edit(embed=embed, view=_Controls(self.guild.id))
+                    except Exception:
+                        pass
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                try:
+                    logger.debug("Embed worker iteration failed", exc_info=True)
+                except Exception:
+                    pass
+
+    async def _queue_embed_update(self, data: dict, *, started_at: float | None = None, duration: float | None = None):
+        try:
+            await self._embed_update_queue.put((self._now_version, data, started_at, duration))
+        except Exception:
+            pass
+
+    async def skip_current(self, suppress_loop_one: bool = False):
+        """Atomic skip API (P1) that sets suppress flag & stops playback under lock."""
+        async with self._lock:
+            if suppress_loop_one and getattr(self, 'loop_one', False):
+                self._suppress_loop_requeue_once = True
+            try:
+                vc = self.vc or (get_voice_client_cached(self.bot, self.guild) if get_voice_client_cached else None)
+                if vc and (vc.is_playing() or vc.is_paused()):
+                    vc.stop()
+            except Exception:
+                pass
+            # Bump version so in-flight embed updates become stale
+            try:
+                self._now_version += 1
+            except Exception:
+                pass
 
     async def _send_rate_limited(self, content=None, **kwargs):
         """Send a channel message but rate-limit frequent error/notify messages per guild.
@@ -234,6 +304,16 @@ class MusicPlayer:
                     continue
                 idle_sleep = 0.5
                 snap = self.queue.snapshot(limit=10)
+                # P3 prefetch throttle: if resolve queue too large, skip this cycle
+                try:
+                    from modules.metrics import metrics_snapshot as _ms
+                    snap_metrics = _ms()
+                    rq = snap_metrics.get("resolve_queue_len", 0) or 0
+                    if rq > 8:  # threshold heuristic
+                        await asyncio.sleep(1.0)
+                        continue
+                except Exception:
+                    pass
                 if not snap:
                     continue
                 tasks = []
@@ -242,8 +322,8 @@ class MusicPlayer:
                     if isinstance(item, dict) and not item.get("url"):
                         q = item.get("webpage_url") or item.get("title") or item.get("query")
                         if q:
-                            # dedupe by query key (webpage_url)
-                            key = q.strip()
+                            # dedupe by normalized query key (P1)
+                            key = self._normalize_prefetch_key(q)
                             if key in self._prefetch_tasks:
                                 # already fetching this query; skip
                                 continue
@@ -267,6 +347,12 @@ class MusicPlayer:
                 if tasks:
                     # New optimized path using as_completed; fallback to legacy on error
                     try:
+                        # gauge metric prefetch_active_tasks
+                        try:
+                            from modules.metrics import set_gauge as _set_g
+                            _set_g("prefetch_active_tasks", len(tasks))
+                        except Exception:
+                            pass
                         start = time.time()
                         for coro in asyncio.as_completed(tasks, timeout=10.0):
                             try:
@@ -295,11 +381,30 @@ class MusicPlayer:
                                         t.cancel()
                                 except Exception:
                                     pass
+                else:
+                    try:
+                        from modules.metrics import set_gauge as _set_g
+                        _set_g("prefetch_active_tasks", 0)
+                    except Exception:
+                        pass
                 await asyncio.sleep(1.0)
         except asyncio.CancelledError:
             return
         except Exception:
             logger.exception("Prefetch worker crashed")
+
+    def _normalize_prefetch_key(self, raw: str) -> str:
+        try:
+            s = (raw or "").strip().lower()
+            # remove common YouTube time/index params for dedupe
+            import re
+            s = re.sub(r"[?&](?:t|time_continue|index)=[0-9hms]+", "", s)
+            if "&list=" in s:
+                # strip playlist id to avoid each position variation
+                s = re.sub(r"[?&]list=[^&]+", "", s)
+            return s
+        except Exception:
+            return raw
 
     async def destroy(self):
         """Cancel background tasks and cleanup prefetched tasks when player is destroyed."""
@@ -348,17 +453,22 @@ class MusicPlayer:
         async def updater():
             try:
                 while True:
-                    if not self.now_message or self._closing:
+                    if self._closing:
                         return
+                    # Wait until initial now_message is created (avoid race early exit)
+                    if not self.now_message:
+                        await asyncio.sleep(0.2)
+                        continue
                     try:
                         elapsed = time.time() - started_at
                         bar = make_progress_bar(elapsed, duration)
                         embed = create_now_playing_embed(self.current, extra_desc=bar, stream_profile=STREAM_PROFILE)
-                        await self.now_message.edit(embed=embed, view=_Controls(self.guild.id))
+                        # queue serialized update (P1)
+                        await self._queue_embed_update(self.current, started_at=started_at, duration=duration)
                     except discord.NotFound:
                         # Tin nhắn đã bị xóa -> tạo lại
                         try:
-                            self.now_message = await self.text_channel.send(embed=embed, view=_Controls(self.guild.id))
+                            await self._queue_embed_update(self.current, started_at=started_at, duration=duration)
                         except Exception:
                             pass
                     except discord.HTTPException:
@@ -499,38 +609,33 @@ class MusicPlayer:
                         try:
                             import modules.metrics as _m; _m.metric_add_time("play_start_delay", max(0.0, time.perf_counter() - t0))
                         except Exception: pass
-                        async def _watchdog():  # enhanced connectivity & stutter mitigation
+                        async def _watchdog():  # enhanced connectivity & stutter mitigation (P0 two-phase)
                             try:
                                 await asyncio.sleep(5)
-                                # Decide whether to attempt restart based on recent attempts (backoff)
-                                do_restart = False
+                                # Phase 1: quick check (connectivity / playing state)
+                                phase1_restart_needed = (not vc.is_connected()) or (not vc.is_playing() and self.queue.qsize() > 0)
+                                if not phase1_restart_needed:
+                                    return  # healthy early exit
+                                # Phase 2: short re-verify to avoid transient gap false positives
+                                await asyncio.sleep(2)
+                                if vc.is_connected() and vc.is_playing():
+                                    return  # recovered
+                                # Decide whether to attempt restart based on attempts per track cap (P0: <=2)
                                 now = time.time()
-                                # reset window if expired
                                 if now - self._watchdog_window_start > self._watchdog_window_seconds:
-                                    self._watchdog_window_start = now
-                                    self._watchdog_attempts = 0
-                                # If below threshold, allow restart
-                                if self._watchdog_attempts < self._watchdog_max_attempts:
-                                    do_restart = True
-                                if (not vc.is_connected()) or (not vc.is_playing() and self.queue.qsize() > 0):
-                                    if do_restart:
-                                        self._watchdog_attempts += 1
-                                        metric_inc("ffmpeg_restarts"); logger.warning("Watchdog restart attempt guild=%s attempt=%s", self.guild.id, self._watchdog_attempts)
-                                        try:
-                                            new_src = create_audio_source_wrapper(data.get("url"), volume=self.volume)
-                                            if vc.is_connected():
-                                                vc.play(new_src, after=_after)
-                                        except Exception: logger.exception("FFmpeg restart failed")
-                                    else:
-                                        logger.warning("Watchdog suppression guild=%s attempts=%s", self.guild.id, self._watchdog_attempts)
-                                # Light jitter guard: if playing but Discord reports not_paused and queue not empty, touch source ref (noop) to keep loop hot
-                                else:
-                                    try:
-                                        _ = getattr(vc, 'source', None)
-                                        if _ is not None:
-                                            pass  # placeholder for future low-risk warm action
-                                    except Exception:
-                                        pass
+                                    self._watchdog_window_start = now; self._watchdog_attempts = 0
+                                per_track_cap = 2
+                                if self._watchdog_attempts >= per_track_cap:
+                                    logger.warning("Watchdog per-track cap reached guild=%s attempts=%s", self.guild.id, self._watchdog_attempts)
+                                    return
+                                self._watchdog_attempts += 1
+                                metric_inc("ffmpeg_restarts"); logger.warning("Watchdog restart (phase2) guild=%s attempt=%s", self.guild.id, self._watchdog_attempts)
+                                try:
+                                    new_src = create_audio_source_wrapper(data.get("url"), volume=self.volume)
+                                    if vc.is_connected():
+                                        vc.play(new_src, after=_after)
+                                except Exception:
+                                    logger.exception("FFmpeg restart failed")
                             except Exception: pass
                         try: asyncio.create_task(_watchdog())
                         except Exception: pass
@@ -553,28 +658,9 @@ class MusicPlayer:
                         except Exception: pass
                         continue
                 try:
-                    embed = create_now_playing_embed(data, stream_profile=STREAM_PROFILE)
-                    if self.now_message:
-                        try:
-                            edit_fn = getattr(self.now_message, "edit", None)
-                            if callable(edit_fn):
-                                await edit_fn(embed=embed, view=_Controls(self.guild.id))
-                            else:
-                                self.now_message = await self.text_channel.send(embed=embed, view=_Controls(self.guild.id))
-                        except Exception:
-                            try:
-                                self.now_message = await self.text_channel.send(embed=embed, view=_Controls(self.guild.id))
-                            except Exception:
-                                logger.exception("Failed to send now-playing embed (both edit and send failed)")
-                    else:
-                        self.now_message = await self.text_channel.send(embed=embed, view=_Controls(self.guild.id))
-                    # Gắn tham chiếu message cho View nếu có để on_timeout có thể làm mới
-                    try:
-                        if self.now_message and getattr(self.now_message, 'components', None):
-                            view = _Controls(self.guild.id)
-                            view.message = self.now_message
-                    except Exception:
-                        pass
+                    # bump version and enqueue initial embed creation via worker
+                    self._now_version += 1
+                    await self._queue_embed_update(data, started_at=played_at, duration=data.get("duration"))
                     await self._start_now_update(played_at, data.get("duration"))
                 except Exception:
                     logger.exception("Failed to send now-playing embed")

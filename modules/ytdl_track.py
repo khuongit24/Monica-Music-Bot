@@ -31,7 +31,7 @@ _PLUGIN_HOOKS = {"on_track_resolved": []}  # simple extensibility point
 
 # Negative cache (short TTL) to avoid repeated failing resolves for the same query
 _NEG_CACHE: Dict[str, tuple[float, str]] = {}
-_NEG_TTL_SECONDS = 20.0  # keep failures for a short time only
+_NEG_TTL_SECONDS = 20.0  # base TTL (generic); dynamic adjustments applied per error type
 
 # --- Helpers ---
 def _truncate_query(q: str, limit: int = 200) -> str:
@@ -51,11 +51,25 @@ def record_circuit_transition(opening: bool, streak: int = 0):
         if opening:
             try:
                 metric_inc("resolve_circuit_open_events")
+                # gauge 1 = degraded
+                from modules.metrics import set_gauge as _set_g
+                try:
+                    _set_g("circuit_state", 1)
+                except Exception:
+                    pass
             except Exception:
                 pass
             if logger:
                 logger.error("Resolve circuit OPEN (streak=%s cooldown=%ss)", streak, _RESOLVE_COOLDOWN_SECONDS)
         else:
+            try:
+                from modules.metrics import set_gauge as _set_g
+                try:
+                    _set_g("circuit_state", 0)
+                except Exception:
+                    pass
+            except Exception:
+                pass
             if logger:
                 logger.info("Resolve circuit CLOSED after cooldown")
     except Exception:
@@ -156,7 +170,7 @@ class YTDLTrack:
         key = query.strip()
         t_start = time.perf_counter()
 
-        # Negative cache fast-path
+    # Negative cache fast-path (error-specific TTL handled at insert time)
         try:
             neg = _NEG_CACHE.get(key)
             if neg:
@@ -267,15 +281,21 @@ class YTDLTrack:
                         RESOLVE_SEMAPHORE = None
 
                 # --- execute_primary + fallback_chain ---
+                # Hard timeout for entire owner resolve section (P0) to prevent indefinite stalls.
+                owner_deadline = max(10.0, min(40.0, float(timeout) + 10.0))
+                async def _owner_resolve_body():
+                    # Optional global throttle: if RESOLVE_SEMAPHORE provided, use it to limit concurrent owners
+                    if RESOLVE_SEMAPHORE is not None:
+                        try: metric_inc("download_semaphore_waits")
+                        except Exception: pass
+                        async with RESOLVE_SEMAPHORE:
+                            return await _execute_with_retries(query, timeout)
+                    return await _execute_with_retries(query, timeout)
                 # Optional global throttle: if RESOLVE_SEMAPHORE provided, use it to limit concurrent owners
-                if RESOLVE_SEMAPHORE is not None:
-                    # record waiting on semaphore for metrics
-                    try: metric_inc("download_semaphore_waits")
-                    except Exception: pass
-                    async with RESOLVE_SEMAPHORE:
-                        data = await _execute_with_retries(query, timeout)
-                else:
-                    data = await _execute_with_retries(query, timeout)
+                try:
+                    data = await asyncio.wait_for(_owner_resolve_body(), timeout=owner_deadline)
+                except asyncio.TimeoutError:
+                    raise RuntimeError("Quá thời gian xử lý nguồn (timeout)")
 
                 # --- url_finalize ---
                 data = _finalize_and_pick_url(data)
@@ -325,13 +345,20 @@ class YTDLTrack:
             try:
                 # When allowing threshold crossing, apply exponential backoff multiplier
                 if _RESOLVE_FAIL_STREAK >= (_RESOLVE_FAIL_THRESHOLD or 1):
-                    # multiplier grows as powers of two but capped to avoid excessively long lockouts
-                    exp = min(8, 2 ** (max(0, _RESOLVE_FAIL_STREAK - (_RESOLVE_FAIL_THRESHOLD or 1))))
-                    _RESOLVE_LOCKOUT_UNTIL = time.time() + ((_RESOLVE_COOLDOWN_SECONDS or 5) * exp)
+                    # multiplier grows as powers of two but capped (P0 reduce cap to 5) to avoid long lockouts
+                    exp = min(5, 2 ** (max(0, _RESOLVE_FAIL_STREAK - (_RESOLVE_FAIL_THRESHOLD or 1))))
+                    lockout_seconds = (_RESOLVE_COOLDOWN_SECONDS or 5) * exp
+                    _RESOLVE_LOCKOUT_UNTIL = time.time() + lockout_seconds
                     if not _RESOLVE_CIRCUIT_LAST_OPEN_TS:
                         _RESOLVE_CIRCUIT_LAST_OPEN_TS = time.time()
                     try:
                         metric_inc("resolve_circuit_open_events")
+                    except Exception:
+                        pass
+                    # record lockout duration metric (histogram-like via total/count)
+                    try:
+                        from modules.metrics import observe_lockout_duration as _obs_lock
+                        _obs_lock(lockout_seconds)
                     except Exception:
                         pass
                     record_circuit_transition(True, _RESOLVE_FAIL_STREAK)
@@ -342,9 +369,18 @@ class YTDLTrack:
                 _safe_set_future_exception(fut, e)
             except Exception:
                 pass
-            # Negative cache the failure (short TTL)
+            # Negative cache the failure (dynamic TTL by error category)
             try:
+                msg = str(e).lower()
+                ttl = _NEG_TTL_SECONDS
+                if any(k in msg for k in ("timeout", "quá lâu", "time out")):
+                    ttl = min(10.0, _NEG_TTL_SECONDS)  # transient network timeouts shorter cache
+                elif any(k in msg for k in ("không tìm", "not found", "no result")):
+                    ttl = 8.0  # quickly allow re-search attempts
+                elif any(k in msg for k in ("vượt giới hạn", "giới hạn", "length")):
+                    ttl = 60.0  # user error; cache longer
                 _NEG_CACHE[key] = (time.time(), str(e))
+                # store TTL selection by augmenting message (optional) - keep simple for now
             except Exception:
                 pass
             # Ensure mapping cleaned up immediately to avoid stuck futures
@@ -590,6 +626,44 @@ async def search_entries(query: str, limit: int = 3, timeout: float = 15.0) -> l
         return await asyncio.wait_for(fut, timeout=timeout)
 
     data = None
+    # Adaptive timeout control (P3 hardening): track consecutive timeouts per process
+    if not hasattr(search_entries, "_timeout_streak"):
+        search_entries._timeout_streak = 0
+        search_entries._last_timeout_ts = 0.0
+        search_entries._last_success_ts = 0.0
+    # Lightweight recent-result cache (spam mitigation): map (normalized_query, lim) -> (ts, entries)
+    if not hasattr(search_entries, "_recent_cache"):
+        search_entries._recent_cache = {}
+    norm_key = f"{q.lower()}|{lim}"
+    now_ts = time.time()
+    # Recovery logic: if no timeout for >60s, gradually decay streak (halve)
+    try:
+        if search_entries._timeout_streak and (now_ts - search_entries._last_timeout_ts) > 60:
+            search_entries._timeout_streak = max(0, search_entries._timeout_streak // 2)
+    except Exception:
+        pass
+    # If we recently (<=30s) retrieved identical results and caller uses >= current timeout level (fast reuse)
+    try:
+        rc = search_entries._recent_cache.get(norm_key)
+        if rc:
+            ts_rc, entries_rc = rc
+            if (now_ts - ts_rc) <= 30 and entries_rc:
+                from modules.metrics import metric_inc as _mi, set_gauge as _sg
+                _mi("search_recent_reuse")
+                # Update gauges for observability
+                try:
+                    _sg("search_timeout_streak", search_entries._timeout_streak)
+                    lvl = 0
+                    if search_entries._timeout_streak >= 5:
+                        lvl = 2
+                    elif search_entries._timeout_streak >= 3:
+                        lvl = 1
+                    _sg("search_timeout_level", lvl)
+                except Exception:
+                    pass
+                return entries_rc[:lim]
+    except Exception:
+        pass
     try:
         try:
             metric_inc("resolve_attempts")
@@ -605,6 +679,23 @@ async def search_entries(query: str, limit: int = 3, timeout: float = 15.0) -> l
     except asyncio.TimeoutError:
         logger.warning("yt-dlp search timeout for query=%s", _truncate_query(query))
         metric_inc("ytdl_timeout")
+        try:
+            search_entries._timeout_streak += 1
+            search_entries._last_timeout_ts = time.time()
+            from modules.metrics import set_gauge as _sg
+            try:
+                _sg("search_timeout_streak", search_entries._timeout_streak)
+                lvl = 0
+                if search_entries._timeout_streak >= 5:
+                    lvl = 2
+                elif search_entries._timeout_streak >= 3:
+                    lvl = 1
+                _sg("search_timeout_level", lvl)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        # If multiple consecutive timeouts, shorten future search attempt timeout (handled by caller via degrade ladder)
         raise RuntimeError("Tìm kiếm quá lâu, thử lại sau")
     except Exception as e:
         # Fallback: relax format constraints
@@ -631,6 +722,18 @@ async def search_entries(query: str, limit: int = 3, timeout: float = 15.0) -> l
             logger.debug("yt-dlp search final fallback failed", exc_info=True)
             raise RuntimeError("Không thể lấy danh sách kết quả tìm kiếm")
 
+    # Reset timeout streak on success
+    try:
+        search_entries._timeout_streak = 0
+        search_entries._last_success_ts = now_ts
+        from modules.metrics import set_gauge as _sg
+        try:
+            _sg("search_timeout_streak", 0)
+            _sg("search_timeout_level", 0)
+        except Exception:
+            pass
+    except Exception:
+        pass
     # Normalize into entries list
     if isinstance(data, dict) and "entries" in data:
         entries = [e for e in (data.get("entries") or []) if e]
@@ -656,5 +759,15 @@ async def search_entries(query: str, limit: int = 3, timeout: float = 15.0) -> l
             return True  # default permissive
         vids = [e for e in entries if _is_video_like(e)]
         chosen = vids if vids else entries
+        # Cache recent
+        try:
+            search_entries._recent_cache[norm_key] = (now_ts, chosen[:lim])
+        except Exception:
+            pass
         return chosen[:lim]
+    # Single entry wrap list
+    try:
+        search_entries._recent_cache[norm_key] = (now_ts, [data])
+    except Exception:
+        pass
     return [data]

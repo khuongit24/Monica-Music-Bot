@@ -23,10 +23,30 @@ _METRICS = {
     "resolve_time_count": 0,
     "ffmpeg_restarts": 0,
     "ffmpeg_restart_count": 0,
+    # search interaction metrics (P0)
+    "search_presented": 0,
+    "search_selected": 0,
+    "search_timeout": 0,
+    "search_fallback": 0,
+    # adaptive search hardening
+    "search_timeout_streak": 0,  # gauge (consecutive timeouts)
+    "search_timeout_level": 0,   # gauge (0=15s 1=8s 2=5s)
+    "search_recent_reuse": 0,    # count of times we reused cached recent search results
+    # circuit / lockout timing
+    "resolve_lockout_seconds_total_seconds": 0.0,
+    "resolve_lockout_seconds_count": 0,
     # prefetch related
     "prefetch_resolved": 0,
     "prefetch_idle_cycles": 0,
     "prefetch_inplace_updates": 0,
+    # extended gauges / P2-P3
+    "prefetch_active_tasks": 0,
+    "queue_length_active": 0,
+    "circuit_state": 0,  # 1=open 0=closed
+    "voice_reconnect_attempt": 0,
+    "voice_reconnect_success": 0,
+    "play_flood_coalesced": 0,
+    "queue_reject_full": 0,
     # observability / rare conditions
     "queue_unknown_type": 0,
     # latency metrics (average derived from *_total_seconds / *_count)
@@ -66,5 +86,14 @@ def set_gauge(name: str, value):
     """Set a gauge-like metric to a specific value."""
     try:
         _METRICS[name] = value
+    except Exception:
+        pass
+
+
+def observe_lockout_duration(seconds: float):
+    """Record a resolve circuit lockout duration (P0)."""
+    try:
+        _METRICS["resolve_lockout_seconds_total_seconds"] = _METRICS.get("resolve_lockout_seconds_total_seconds", 0.0) + seconds
+        _METRICS["resolve_lockout_seconds_count"] = _METRICS.get("resolve_lockout_seconds_count", 0) + 1
     except Exception:
         pass

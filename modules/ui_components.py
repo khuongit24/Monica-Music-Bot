@@ -5,6 +5,7 @@ Centralizes Discord UI elements like buttons, modals, and embeds.
 
 import logging
 import discord
+import asyncio
 from discord import ui
 from typing import Optional
 import time
@@ -814,7 +815,7 @@ def build_search_list_embed(results: list[dict], *, query: str, limit: int = 3) 
             embed.set_thumbnail(url=results[0]["thumbnail"])  # best-effort
         except Exception:
             pass
-    embed.set_footer(text="Tự động chọn #1 sau 20s nếu bạn không chọn")
+    embed.set_footer(text="Tự động chọn #1 sau 12s nếu bạn không chọn")
     try:
         embed.add_field(name="Từ khóa", value=truncate(query, 80), inline=False)
     except Exception:
@@ -837,6 +838,12 @@ class SelectSearchResultView(ui.View):
         self.results = list(results)
         self.query = query
         self.chosen_entry: dict | None = None
+        # Future used by caller to await selection without polling (P0 improvement)
+        try:
+            self._loop = asyncio.get_running_loop()
+            self._selection_future = self._loop.create_future()
+        except Exception:
+            self._selection_future = None
         # Build options (<=25 by Discord constraints)
         options: list[discord.SelectOption] = []
         for idx, e in enumerate(self.results[:25]):
@@ -865,6 +872,12 @@ class SelectSearchResultView(ui.View):
                     await interaction.edit_original_response(view=self)
                 except Exception:
                     pass
+            # Resolve future if present
+            try:
+                if self._selection_future and not self._selection_future.done():
+                    self._selection_future.set_result(self.chosen_entry)
+            except Exception:
+                pass
         select.callback = _callback  # type: ignore[assignment]
         self.add_item(select)
 
