@@ -30,6 +30,21 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
                 writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body.encode())
             except Exception:
                 writer.write(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length:0\r\n\r\n")
+        elif path.startswith(b"/healthz"):
+            # Health check endpoint returning loop status and background tasks count
+            try:
+                loop = asyncio.get_running_loop()
+                loop_running = loop.is_running()
+                background_tasks = len([t for t in asyncio.all_tasks(loop) if not t.done()])
+                body = json.dumps({
+                    "status": "healthy" if loop_running else "unhealthy",
+                    "loop_running": loop_running,
+                    "background_tasks": background_tasks
+                }) + "\n"
+                writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body.encode())
+            except Exception as e:
+                body = json.dumps({"status": "error", "error": str(e)}) + "\n"
+                writer.write(b"HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body.encode())
         else:
             writer.write(b"HTTP/1.1 404 Not Found\r\nContent-Length:0\r\n\r\n")
         await writer.drain()

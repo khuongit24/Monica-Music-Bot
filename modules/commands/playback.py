@@ -70,12 +70,8 @@ async def handle_skip(bot: discord.Client, players: dict[int, Any], ctx_or_inter
             )
         return
     if getattr(player, "loop_one", False):
-        try:
-            await player.skip_current(suppress_loop_one=True)
-        except Exception:
-            vc.stop()
-    else:
-        vc.stop()
+        player._suppress_loop_requeue_once = True
+    vc.stop()
     if hasattr(ctx_or_interaction, "response"):
         await ctx_or_interaction.response.send_message("⏭️ Đã skip bài hiện tại", ephemeral=True)
     else:

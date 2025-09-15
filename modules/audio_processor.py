@@ -4,7 +4,10 @@ Handles stream profiles, audio source creation, and URL sanitization.
 """
 
 import logging
-from typing import Optional, Tuple
+import time
+from typing import Optional, Tuple, Dict, Any
+from modules.metrics import hist_observe_time, metric_inc
+from modules.config import load_config
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 from functools import lru_cache
 import discord
@@ -167,48 +170,80 @@ def create_audio_source(stream_url: str, volume: float, stream_profile: str, ffm
     - If volume is 1.0 and source appears to be Opus (webm/opus/ogg), attempt stream copy (-c:a copy) to avoid re-encode.
     - Falls back to previous transcode path for other codecs or when volume != 1.0 (need volume filter).
     """
-    stream_url = sanitize_stream_url(stream_url) or stream_url
-    before, options = get_ffmpeg_options_for_profile(stream_profile, volume, ffmpeg_bitrate, ffmpeg_threads, http_ua)
+    # Delegate to new builder which can take optional metadata from ytdl
+    from modules.config import load_config as _load_config
+    cfg = _load_config()
+    safe_threads = int(cfg.get('ffmpeg_threads', ffmpeg_threads or 1) or 1)
+    start_ts = time.time()
+    try:
+        before, options, used_copy = build_ffmpeg_args(stream_url, volume, stream_profile, ffmpeg_bitrate, safe_threads, http_ua, metadata=None)
+        hist_observe_time('audio_prepare_time', time.time() - start_ts)
+        if used_copy:
+            metric_inc('audio_prepare_copy', 1)
+        else:
+            metric_inc('audio_prepare_transcode', 1)
+    except Exception:
+        # Fallback to previous behavior if builder fails
+        before, options = get_ffmpeg_options_for_profile(stream_profile, volume, ffmpeg_bitrate, safe_threads, http_ua)
+        used_copy = False
+    kwargs = {"before_options": before, "options": options}
+    try:
+        logger.info("FFmpeg profile=%s copy=%s options=%s", stream_profile, used_copy, options)
+        return discord.FFmpegOpusAudio(stream_url, **kwargs)
+    except Exception as e:
+        logger.warning("FFmpegOpusAudio failed (%s); fallback to PCM", e)
+        return discord.FFmpegPCMAudio(stream_url, **kwargs)
 
-    # Detect if we can copy the stream (saves quality & CPU) only when no volume change
+
+def build_ffmpeg_args(stream_url: str, volume: float, stream_profile: str, ffmpeg_bitrate: str, ffmpeg_threads: int, http_ua: str, metadata: Optional[Dict[str, Any]] = None) -> Tuple[str, str, bool]:
+    """Build before_options and options for ffmpeg. Returns (before, options, used_copy).
+
+    If `metadata` (the yt-dlp info dict) is provided, prefer using its format acodec/ext fields to
+    decide whether stream copy (-c:a copy) is safe. Otherwise fall back to heuristics based on URL.
+    """
+    stream_url = sanitize_stream_url(stream_url) or stream_url
     lower_url = (stream_url or "").lower()
-    # Broaden copy detection by also considering picked format metadata if present in URL query (can't access full info dict here directly)
-    # Heuristic: if URL hints opus/webm/ogg OR bitrate <= 160k (already efficient) and volume unchanged, attempt copy.
-    copy_candidate = volume == 1.0 and any(tok in lower_url for tok in (".webm", ".opus", ".ogg", "mime=audio%2Fwebm", "mime=audio/webm"))
-    if copy_candidate:
-        # Replace audio options part after '-vn' with copy; preserve before-options and minimal flags
-        # We'll keep analyze/probe adjustments from profile for stability, but strip re-encode flags
+    used_copy = False
+    # simple metadata-aware decision
+    try:
+        if metadata:
+            fmt_acodec = (metadata.get('_picked_fmt_acodec') or metadata.get('acodec') or '').lower()
+            fmt_ext = (metadata.get('_picked_fmt_ext') or metadata.get('ext') or '').lower()
+            # If codec is opus or container indicates opus/m4a and volume ==1, copy is safe
+            if volume == 1.0 and ('opus' in fmt_acodec or fmt_ext in ('webm','opus','ogg','m4a')):
+                used_copy = True
+        else:
+            # URL heuristic
+            if volume == 1.0 and any(tok in lower_url for tok in ('.webm', '.opus', '.ogg', 'mime=audio%2Fwebm', 'mime=audio/webm', '.m4a')):
+                used_copy = True
+    except Exception:
+        used_copy = False
+
+    before, options = get_ffmpeg_options_for_profile(stream_profile, volume, ffmpeg_bitrate, ffmpeg_threads, http_ua)
+    if used_copy:
         try:
-            # Basic safe options for copy
-            if stream_profile == "stable":
+            if stream_profile == 'stable':
                 copy_opts = '-vn -c:a copy -ar 48000 -ac 2 -fflags +genpts -avoid_negative_ts make_zero -nostats -loglevel error'
             else:
                 copy_opts = '-vn -c:a copy -ar 48000 -ac 2 -nostats -loglevel error'
             options = copy_opts
         except Exception:
-            pass
+            used_copy = False
 
-    # If high bitrate (>192k) and not copying, lightly enlarge buffer to reduce under-runs (non-breaking augmentation)
+    # adjust buffers for high bitrate when not copying
     try:
         br_num = int(str(ffmpeg_bitrate).lower().replace('k','').strip() or 0)
     except Exception:
         br_num = 0
-    if br_num >= 192 and not copy_candidate:
-        # Append extra buffer flags if not already present
-        if "-bufsize" not in options:
-            options += " -bufsize 2M"
-        if "-rtbufsize" not in options:
-            options += " -rtbufsize 2M"
-        # Increase thread queue size if present in before options
-        if "-thread_queue_size" in before:
-            before = before.replace("-thread_queue_size 1024", "-thread_queue_size 2048")
-    kwargs = {"before_options": before, "options": options}
-    try:
-        logger.info("FFmpeg profile=%s copy=%s options=%s", stream_profile, copy_candidate, options)
-        return discord.FFmpegOpusAudio(stream_url, **kwargs)
-    except Exception as e:
-        logger.warning("FFmpegOpusAudio failed (%s); fallback to PCM", e)
-        return discord.FFmpegPCMAudio(stream_url, **kwargs)
+    if br_num >= 192 and not used_copy:
+        if '-bufsize' not in options:
+            options += ' -bufsize 2M'
+        if '-rtbufsize' not in options:
+            options += ' -rtbufsize 2M'
+        if '-thread_queue_size' in before:
+            before = before.replace('-thread_queue_size 1024', '-thread_queue_size 2048')
+
+    return before, options, used_copy
 
 
 def validate_domain(url: str, allowed_domains: set) -> bool:

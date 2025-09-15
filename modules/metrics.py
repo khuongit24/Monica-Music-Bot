@@ -23,30 +23,10 @@ _METRICS = {
     "resolve_time_count": 0,
     "ffmpeg_restarts": 0,
     "ffmpeg_restart_count": 0,
-    # search interaction metrics (P0)
-    "search_presented": 0,
-    "search_selected": 0,
-    "search_timeout": 0,
-    "search_fallback": 0,
-    # adaptive search hardening
-    "search_timeout_streak": 0,  # gauge (consecutive timeouts)
-    "search_timeout_level": 0,   # gauge (0=15s 1=8s 2=5s)
-    "search_recent_reuse": 0,    # count of times we reused cached recent search results
-    # circuit / lockout timing
-    "resolve_lockout_seconds_total_seconds": 0.0,
-    "resolve_lockout_seconds_count": 0,
     # prefetch related
     "prefetch_resolved": 0,
     "prefetch_idle_cycles": 0,
     "prefetch_inplace_updates": 0,
-    # extended gauges / P2-P3
-    "prefetch_active_tasks": 0,
-    "queue_length_active": 0,
-    "circuit_state": 0,  # 1=open 0=closed
-    "voice_reconnect_attempt": 0,
-    "voice_reconnect_success": 0,
-    "play_flood_coalesced": 0,
-    "queue_reject_full": 0,
     # observability / rare conditions
     "queue_unknown_type": 0,
     # latency metrics (average derived from *_total_seconds / *_count)
@@ -54,6 +34,21 @@ _METRICS = {
     "play_start_delay_count": 0,
     "queue_wait_time_total_seconds": 0.0,
     "queue_wait_time_count": 0,
+    # audio source prepare metrics
+    "audio_prepare_time_total_seconds": 0.0,
+    "audio_prepare_time_count": 0,
+    # counters for whether we copied stream or transcoded
+    "audio_prepare_copy": 0,
+    "audio_prepare_transcode": 0,
+    # HTTP errors
+    "http_errors": 0,
+    "http_4xx_errors": 0,
+    "http_5xx_errors": 0,
+    # Gauges
+    "queue_size": 0,
+    # Cache metrics
+    "cache_evicted": 0,
+    "cache_size": 0,
 }
 
 def metric_inc(name: str, delta: int = 1):
@@ -90,10 +85,20 @@ def set_gauge(name: str, value):
         pass
 
 
-def observe_lockout_duration(seconds: float):
-    """Record a resolve circuit lockout duration (P0)."""
+def hist_observe_time(name: str, seconds: float):
+    """Convenience to add timing observations (keeps *_total_seconds and *_count)."""
     try:
-        _METRICS["resolve_lockout_seconds_total_seconds"] = _METRICS.get("resolve_lockout_seconds_total_seconds", 0.0) + seconds
-        _METRICS["resolve_lockout_seconds_count"] = _METRICS.get("resolve_lockout_seconds_count", 0) + 1
+        _METRICS.setdefault(f"{name}_total_seconds", 0.0)
+        _METRICS.setdefault(f"{name}_count", 0)
+        _METRICS[f"{name}_total_seconds"] += float(seconds)
+        _METRICS[f"{name}_count"] += 1
+    except Exception:
+        pass
+
+
+def gauge_set(name: str, value):
+    """Set a simple gauge value."""
+    try:
+        _METRICS[name] = value
     except Exception:
         pass

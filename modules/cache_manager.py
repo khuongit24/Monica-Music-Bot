@@ -9,7 +9,7 @@ import logging
 from collections import OrderedDict
 from typing import Dict, Any, Optional
 
-from modules.metrics import metric_inc
+from modules.metrics import metric_inc, gauge_set
 import json
 import os
 
@@ -38,6 +38,10 @@ class CacheManager:
         entry = self._cache.get(key)
         if not entry:
             metric_inc("cache_miss")
+            try:
+                gauge_set("cache_size", len(self._cache))
+            except Exception:
+                pass
             return None
         
         # Quick TTL check without lock for expired entries
@@ -77,6 +81,10 @@ class CacheManager:
                 pass  # Entry was removed by another operation
         
         metric_inc("cache_hits")
+        try:
+            gauge_set("cache_size", len(self._cache))
+        except Exception:
+            pass
         return entry["data"]
     
     async def put(self, key: str, data: Dict[str, Any]):
@@ -139,7 +147,12 @@ class CacheManager:
                         eviction_count += 1
                 
                 if eviction_count > 0:
-                    logger.debug("Cache evicted %d entries (size: %d)", eviction_count, len(self._cache))
+                        metric_inc("cache_evicted", eviction_count)
+                        try:
+                            gauge_set("cache_size", len(self._cache))
+                        except Exception:
+                            pass
+                        logger.debug("Cache evicted %d entries (size: %d)", eviction_count, len(self._cache))
     
     async def cleanup_expired(self):
         """Remove expired cache entries - called by background task."""
@@ -156,6 +169,11 @@ class CacheManager:
                 self._cache.pop(key, None)
             
             if expired_keys:
+                metric_inc("cache_evicted", len(expired_keys))
+                try:
+                    gauge_set("cache_size", len(self._cache))
+                except Exception:
+                    pass
                 logger.debug("Cleaned up %d expired cache entries", len(expired_keys))
 
     async def save_to_disk(self, path: str) -> None:
@@ -169,6 +187,10 @@ class CacheManager:
                     json.dump(lean_dump, fh)
                 os.replace(tmp, path)
                 metric_inc("cache_persist_save")
+                try:
+                    gauge_set("cache_size", len(self._cache))
+                except Exception:
+                    pass
                 logger.debug("Cache persisted to %s", path)
             except Exception:
                 logger.exception("Failed to persist cache")
@@ -185,6 +207,10 @@ class CacheManager:
                 for k, v in data.items():
                     self._cache[k] = {"data": v.get("data"), "ts": v.get("ts", time.time()), "ttl": v.get("ttl", self.ttl_seconds), "hits": v.get("hits", 0)}
                 metric_inc("cache_persist_load")
+                try:
+                    gauge_set("cache_size", len(self._cache))
+                except Exception:
+                    pass
                 logger.debug("Loaded %d cache entries from %s", len(data), path)
                 return len(data)
             except Exception:
@@ -205,6 +231,10 @@ class CacheManager:
         async with self._lock:
             count = len(self._cache)
             self._cache.clear()
+            try:
+                gauge_set("cache_size", 0)
+            except Exception:
+                pass
             return count
 
 

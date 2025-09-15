@@ -90,8 +90,23 @@ def validate_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
             cfg[key] = default; changed = True
     clamp_int("max_queue_size", 1, DEFAULT_CONFIG["max_queue_size"])
     clamp_int("download_concurrency", 1, DEFAULT_CONFIG["download_concurrency"])
+    # enforce a reasonable upper bound to avoid accidental DoS from crazy values
+    try:
+        dc = int(cfg.get("download_concurrency", DEFAULT_CONFIG["download_concurrency"]))
+        if dc > 8:
+            logger.warning("Config 'download_concurrency'=%s > 8; clamped to 8", dc)
+            cfg["download_concurrency"] = 8; changed = True
+    except Exception:
+        pass
     clamp_int("cache_size_limit", 1, DEFAULT_CONFIG["cache_size_limit"])
     clamp_int("ffmpeg_threads", 1, DEFAULT_CONFIG["ffmpeg_threads"])
+    try:
+        ft = int(cfg.get("ffmpeg_threads", DEFAULT_CONFIG["ffmpeg_threads"]))
+        if ft > 8:
+            logger.warning("Config 'ffmpeg_threads'=%s > 8; clamped to 8", ft)
+            cfg["ffmpeg_threads"] = 8; changed = True
+    except Exception:
+        pass
     clamp_int("now_update_interval_seconds", 3, DEFAULT_CONFIG["now_update_interval_seconds"])
     clamp_int("idle_disconnect_seconds", 30, DEFAULT_CONFIG["idle_disconnect_seconds"])
     clamp_int("max_track_seconds", 0, DEFAULT_CONFIG["max_track_seconds"])  # 0 means unlimited
@@ -99,6 +114,19 @@ def validate_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
     if profile not in ("stable", "low-latency", "super-low-latency"):
         logger.warning("Unknown stream_profile=%s; fallback to 'stable'", profile)
         cfg["stream_profile"] = "stable"; changed = True
+    # Validate ffmpeg_bitrate looks like '128k' or a numeric string
+    try:
+        fb = cfg.get("ffmpeg_bitrate")
+        if fb is not None:
+            s = str(fb).strip().lower()
+            if not (s.endswith('k') and s[:-1].isdigit()):
+                logger.warning("Invalid ffmpeg_bitrate=%s; reverting to default %s", fb, DEFAULT_CONFIG['ffmpeg_bitrate'])
+                cfg['ffmpeg_bitrate'] = DEFAULT_CONFIG['ffmpeg_bitrate']; changed = True
+            else:
+                # normalize to e.g. '192k'
+                cfg['ffmpeg_bitrate'] = s
+    except Exception:
+        pass
     if changed:
         try:
             persist_config(cfg)
