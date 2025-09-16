@@ -1,6 +1,6 @@
 # Monica Discord Music Bot
 
-Đây là một dự án bot nhạc cho Discord được phát triển **dành cho mục đích sử dụng cá nhân và nghiên cứu**.
+Đây là một dự án bot nhạc cho Discord được phát triển **dành cho mục đích sử dụng học tập và nghiên cứu**.
 
 ![Use at your own risk](https://img.shields.io/badge/Disclaimer-Use%20at%20your%20own%20risk-red)  
 ![Non-commercial](https://img.shields.io/badge/Use-Non%20Commercial-blue)
