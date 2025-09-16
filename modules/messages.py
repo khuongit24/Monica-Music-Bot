@@ -3,7 +3,6 @@
 Primary language: VI. Optional EN toggle via config.language ('vi'|'en').
 Non-invasive: code referencing old constants still works (constants map to dynamic lookup for active language).
 """
-from typing import Dict
 
 _VI = {
 	"NOWAIT_JOIN_REQUIRED": "Bạn cần vào kênh thoại để yêu cầu phát nhạc",

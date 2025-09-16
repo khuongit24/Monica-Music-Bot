@@ -1,9 +1,6 @@
 import discord
-from typing import Optional, Any
+from typing import Any
 
-from modules.utils import truncate, format_duration, make_progress_bar
-from modules.ui_components import MusicControls, create_now_playing_embed
-from modules.metrics import metric_inc
 
 # Các hàm dưới đây không đăng ký lệnh trực tiếp; bot.py sẽ gọi tới.
 

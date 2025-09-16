@@ -1,6 +1,6 @@
 import time
 import asyncio
-from typing import Dict, Any, Optional, TypedDict
+from typing import Dict, Any, TypedDict
 from modules.metrics import metric_inc, metric_add_time, gauge_set
 from modules.audio_processor import sanitize_stream_url
 
@@ -19,7 +19,7 @@ logger = None
 MAX_TRACK_SECONDS = None
 _CACHE_PUT = None
 _PICK_BEST_AUDIO_URL = None
-_RESOLVING = None
+_RESOLVING = {}
 _RESOLVE_LOCK = None
 _RESOLVE_KEY_LOCKS: Dict[str, asyncio.Lock] = {}
 _RESOLVE_FAIL_STREAK = None
@@ -90,6 +90,15 @@ def _safe_set_future_exception(fut, exc):
     try:
         if fut and not fut.done():
             fut.set_exception(exc)
+            # Mark the exception as retrieved so garbage-collection of the Future
+            # does not emit "Future exception was never retrieved" if no one
+            # awaited the Future. Calling exception() is safe and does not
+            # prevent awaiters from receiving the exception when they await.
+            try:
+                _ = fut.exception()
+            except Exception:
+                # ignore; best-effort retrieval
+                pass
     except Exception:
         try:
             if fut and not fut.done():
@@ -131,6 +140,14 @@ class YTDLTrack:
         global _RESOLVE_STATE, _RESOLVE_PROBE_ATTEMPTS, RESOLVE_SEMAPHORE
         # these are mutated/assigned in this function
         global _RESOLVE_LOCK, _RESOLVING
+
+        # local safety defaults to avoid UnboundLocalError in failure paths
+        fut = None
+        owner = False
+
+        # Ensure resolving dict exists (in case bot didn't inject it)
+        if _RESOLVING is None:
+            _RESOLVING = {}
 
         now = time.time()
 
@@ -422,6 +439,20 @@ class YTDLTrack:
 # --- Decomposed helper steps (non-invasive; reuses original logic pieces) ---
 async def _execute_with_fallbacks(query: str, timeout: float):
     loop = asyncio.get_running_loop()
+    def _run_in_executor_safe(loop, executor, func):
+        fut = loop.run_in_executor(executor, func)
+        # Attach a done callback to consume result() so exceptions aren't left un-retrieved
+        def _consume(f):
+            try:
+                _ = f.exception()
+            except Exception:
+                pass
+        try:
+            fut.add_done_callback(_consume)
+        except Exception:
+            # asyncio.Future from run_in_executor may not support add_done_callback in some envs
+            pass
+        return fut
     # Normalize plain-text queries to use yt-dlp default_search prefix to avoid 'not a valid URL' errors
     try:
         q = query.strip()
@@ -444,8 +475,18 @@ async def _execute_with_fallbacks(query: str, timeout: float):
         metric_inc("resolve_attempts")
         try:
             start = time.perf_counter()
-            fut_exec = loop.run_in_executor(_YTDL_EXECUTOR, lambda: ytdl.extract_info(q, download=False))
-            data = await asyncio.wait_for(fut_exec, timeout=timeout)
+            # safe wrapper to avoid letting exceptions propagate uncaught from the threadpool
+            def _safe_call(fn):
+                try:
+                    return (True, fn())
+                except Exception as _e:
+                    return (False, _e)
+
+            fut_exec = _run_in_executor_safe(loop, _YTDL_EXECUTOR, lambda: _safe_call(lambda: ytdl.extract_info(q, download=False)))
+            ok, res = await asyncio.wait_for(fut_exec, timeout=timeout)
+            if not ok:
+                raise res
+            data = res
             metric_add_time("ytdl_primary_time", time.perf_counter() - start)
             # reset consecutive timeout counter on success
             try:
@@ -479,17 +520,41 @@ async def _execute_with_fallbacks(query: str, timeout: float):
                 # cache alt ytdl instances keyed by frozenset of option items
                 if not hasattr(_execute_with_fallbacks, "_ytdl_cache"):
                     _execute_with_fallbacks._ytdl_cache = {}
-                k = tuple(sorted(alt_opts.items()))
-                alt_ytdl = _execute_with_fallbacks._ytdl_cache.get(k)
+                # Build a stable, hashable key from alt_opts by serializing values.
+                def _hashable_key(d):
+                    items = []
+                    for kk in sorted(d.keys()):
+                        vv = d[kk]
+                        try:
+                            if isinstance(vv, (set, list, tuple)):
+                                val = tuple(sorted(map(repr, vv)))
+                            else:
+                                val = repr(vv)
+                        except Exception:
+                            val = repr(vv)
+                        items.append((kk, val))
+                    return tuple(items)
+
+                k = _hashable_key(alt_opts)
+                try:
+                    alt_ytdl = _execute_with_fallbacks._ytdl_cache.get(k)
+                except Exception:
+                    alt_ytdl = None
                 if alt_ytdl is None:
                     try:
                         alt_ytdl = YoutubeDL(alt_opts)
-                        _execute_with_fallbacks._ytdl_cache[k] = alt_ytdl
+                        try:
+                            _execute_with_fallbacks._ytdl_cache[k] = alt_ytdl
+                        except Exception:
+                            pass
                     except Exception:
                         alt_ytdl = YoutubeDL(alt_opts)
                 start2 = time.perf_counter()
-                fut2 = loop.run_in_executor(_YTDL_EXECUTOR, lambda: alt_ytdl.extract_info(q, download=False))
-                data = await asyncio.wait_for(fut2, timeout=timeout)
+                fut2 = _run_in_executor_safe(loop, _YTDL_EXECUTOR, lambda: _safe_call(lambda: alt_ytdl.extract_info(q, download=False)))
+                ok2, res2 = await asyncio.wait_for(fut2, timeout=timeout)
+                if not ok2:
+                    raise res2
+                data = res2
                 metric_add_time("ytdl_fallback_time", time.perf_counter() - start2)
             except asyncio.TimeoutError:
                 logger.warning("yt-dlp fallback timeout for query=%s", query)
@@ -512,17 +577,26 @@ async def _execute_with_fallbacks(query: str, timeout: float):
                     minimal_opts["noplaylist"] = True
                     from yt_dlp import YoutubeDL
                     # reuse minimal ytdl instance if cached
-                    k2 = tuple(sorted(minimal_opts.items()))
-                    minimal_ytdl = _execute_with_fallbacks._ytdl_cache.get(k2)
+                    k2 = _hashable_key(minimal_opts)
+                    try:
+                        minimal_ytdl = _execute_with_fallbacks._ytdl_cache.get(k2)
+                    except Exception:
+                        minimal_ytdl = None
                     if minimal_ytdl is None:
                         try:
                             minimal_ytdl = YoutubeDL(minimal_opts)
-                            _execute_with_fallbacks._ytdl_cache[k2] = minimal_ytdl
+                            try:
+                                _execute_with_fallbacks._ytdl_cache[k2] = minimal_ytdl
+                            except Exception:
+                                pass
                         except Exception:
                             minimal_ytdl = YoutubeDL(minimal_opts)
                     start3 = time.perf_counter()
-                    fut3 = loop.run_in_executor(_YTDL_EXECUTOR, lambda: minimal_ytdl.extract_info(q, download=False))
-                    data = await asyncio.wait_for(fut3, timeout=timeout)
+                    fut3 = _run_in_executor_safe(loop, _YTDL_EXECUTOR, lambda: _safe_call(lambda: minimal_ytdl.extract_info(q, download=False)))
+                    ok3, res3 = await asyncio.wait_for(fut3, timeout=timeout)
+                    if not ok3:
+                        raise res3
+                    data = res3
                     metric_add_time("ytdl_minimal_time", time.perf_counter() - start3)
                 except Exception:
                     logger.exception("yt-dlp final fallback failed")

@@ -7,7 +7,6 @@ import logging
 import time
 from typing import Optional, Tuple, Dict, Any
 from modules.metrics import hist_observe_time, metric_inc
-from modules.config import load_config
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 from functools import lru_cache
 import discord

@@ -1,6 +1,7 @@
 """Optional Prometheus exposition (simple HTTP server)"""
-import asyncio, logging, json
-from typing import Callable
+import asyncio
+import logging
+import json
 from modules.metrics import metrics_snapshot
 
 logger = logging.getLogger("Monica.MetricsHTTP")

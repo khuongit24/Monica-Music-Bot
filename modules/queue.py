@@ -1,9 +1,8 @@
 from collections import deque
 import asyncio
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, Optional, List
 from modules.metrics import gauge_set
-import asyncio
-from typing import Coroutine
+import weakref
 
 
 _queue_gauge_task: Optional[asyncio.Task] = None
@@ -59,14 +58,16 @@ class AsyncDequeQueue:
         except Exception:
             pass
 
-    # Module-global weak registry for gauge probing
-    _GLOBAL_INSTANCES: List['AsyncDequeQueue'] = []
+    # Module-global weak registry for gauge probing. Using a WeakSet means
+    # queues won't be kept alive solely by the registry (avoids leaks).
+    _GLOBAL_INSTANCES = weakref.WeakSet()
 
     @classmethod
     def _register_instance(cls, inst: 'AsyncDequeQueue') -> None:
         try:
-            cls._GLOBAL_INSTANCES.append(inst)
+            cls._GLOBAL_INSTANCES.add(inst)
         except Exception:
+            # best-effort registration during construction
             pass
 
     @classmethod

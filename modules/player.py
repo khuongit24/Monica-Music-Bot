@@ -6,8 +6,7 @@ import discord
 from modules.queue import AsyncDequeQueue
 from modules.ytdl_track import YTDLTrack
 from modules.metrics import metric_inc
-from modules.utils import make_progress_bar, truncate, format_duration, THEME_COLOR, _safe_create_task
-from modules.audio_processor import create_audio_source
+from modules.utils import make_progress_bar, truncate, format_duration, _safe_create_task
 
 # Các biến toàn cục sẽ được gán từ bot.py khi khởi tạo
 MAX_QUEUE_SIZE = None
@@ -29,7 +28,7 @@ class MusicPlayer:
     """
 
     def __init__(self, guild: discord.Guild, text_channel: discord.TextChannel) -> None:
-        from bot import bot as _bot, players  # lazy import to avoid circular
+        from bot import bot as _bot  # lazy import to avoid circular
         self.bot = _bot
         self.guild = guild
         self.text_channel = text_channel

@@ -2,7 +2,6 @@ import discord
 from typing import Any
 
 from modules.ui_components import QueuePaginatorView
-from modules.utils import truncate, format_duration
 
 async def show_queue_ephemeral(players: dict[int, Any], interaction: discord.Interaction) -> None:
     player = players.get(interaction.guild.id)

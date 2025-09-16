@@ -1,4 +1,12 @@
 {
   "prefix": "!",
-  "ffmpeg_bitrate": "192k"
+  "ffmpeg_bitrate": "192k",
+  "trace_logging": true,
+  "structured_logging": false,
+  "ffmpeg_threads": 1,
+  "download_concurrency": 2,
+  "enable_prometheus": true,
+  "prometheus_port": 9109,
+  "presence_text": "/help hoặc /play để bắt đầu ✨",
+  "presence_type": "listening"
 }

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import logging
 try:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
@@ -18,24 +19,22 @@ import os
 import logging
 import time
 import signal
-from collections import deque, OrderedDict
-from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
+from collections import OrderedDict
+from urllib.parse import urlparse
 from logging.handlers import RotatingFileHandler
-from typing import Dict, Optional, Any, List, Union, Callable, Tuple, Awaitable
+from typing import Dict, Optional, Any, List, Tuple
 
 import discord
 from discord.ext import commands
 from discord import ui
 from yt_dlp import YoutubeDL
-import yt_dlp
 import threading
 
 # Import custom modules
 from modules.config import load_env_file, load_config, get_token, persist_config
-from modules.metrics import metric_inc, metric_add_time, metrics_snapshot, get_average_resolve_time
-from modules.utils import THEME_COLOR, OK_COLOR, ERR_COLOR, format_duration, truncate, make_progress_bar, write_snapshot_file
-from modules.messages import msg
-from modules.voice_manager import get_voice_client_cached, invalidate_voice_cache, cleanup_voice_cache, ensure_connected_for_user
+from modules.metrics import metric_inc, metrics_snapshot, get_average_resolve_time
+from modules.utils import THEME_COLOR, OK_COLOR, ERR_COLOR, format_duration, truncate, write_snapshot_file
+from modules.voice_manager import get_voice_client_cached, cleanup_voice_cache, ensure_connected_for_user
 from modules.audio_processor import sanitize_stream_url, pick_best_audio_url, get_ffmpeg_options_for_profile, create_audio_source, validate_domain
 from modules.ytdl_track import YTDLTrack as ModularYTDLTrack
 from modules.player import MusicPlayer as ModularMusicPlayer
@@ -46,7 +45,7 @@ from modules.cache_manager import persistence_loop
 # Group 2 refactor imports: command handler delegations
 from modules.commands import playback as cmd_playback
 from modules.commands import queue as cmd_queue
-from modules.ui_runtime import build_now_embed as ui_build_now_embed, start_now_updater as ui_start_now_updater
+from modules.ui_runtime import build_now_embed as ui_build_now_embed
 
 # Load environment variables early
 load_env_file()
@@ -74,7 +73,7 @@ STREAM_PROFILE: str = str(CONFIG.get("stream_profile", "stable")).lower().strip(
 NOW_UPDATE_INTERVAL: int = max(5, int(CONFIG.get("now_update_interval_seconds", 12)))
 PRESENCE_TEXT: str = str(CONFIG.get("presence_text", "/help hoặc /play để bắt đầu ✨"))
 PRESENCE_TYPE: str = str(CONFIG.get("presence_type", "listening")).lower()
-VERSION: str = "v3.9.6-beta02" 
+VERSION: str = "v3.9.6-prerelease"  # prerelease tag for testing
 GIT_COMMIT: Optional[str] = os.getenv("GIT_COMMIT") or os.getenv("COMMIT_SHA") or None
 
 # Playbook modes & Spotify removed. Supported sources only.
@@ -145,7 +144,8 @@ if not logger.handlers:
     if structured:
         class _JsonFmt(logging.Formatter):
             def format(self, record):
-                import json, time as _t
+                import json
+                import time as _t
                 base = {
                     "ts": _t.strftime('%Y-%m-%dT%H:%M:%S', _t.gmtime(record.created)),
                     "lvl": record.levelname,
@@ -185,7 +185,9 @@ def _maybe_start_control_server():  # minimal inline to avoid circular imports
     except Exception:
         logger.warning("Control port invalid (not int): %s", port); return
     try:
-        import socket, json, threading, traceback
+        import socket
+        import json
+        import threading
         from modules.metrics import metrics_snapshot
         start_ts = time.time()
         def handler(conn, addr):
@@ -619,7 +621,6 @@ def get_player_for_ctx(guild: discord.Guild, text_channel: discord.TextChannel) 
 Đồng bộ hóa nguồn sự thật cho giao diện điều khiển về modules/ui_components.
 Giữ alias để các đoạn code cũ trong bot.py (nếu có) vẫn import được MusicControls.
 """
-from modules.ui_components import MusicControls
  
 
 
@@ -661,6 +662,45 @@ async def text_report(ctx):
         await ctx.send("Vui lòng dùng lệnh slash /report để mở form báo cáo tương tác.")
     except Exception:
         pass
+
+
+@bot.command(name="help")
+async def text_help(ctx):
+    """Text-command alias for the slash /help UI.
+
+    Reuses the same HelpView and create_help_embed so behavior is identical.
+    """
+    try:
+        logger.info("Attempting to import HelpView and create_help_embed (text help)")
+        from modules.ui_components import HelpView, create_help_embed
+        embed = create_help_embed(
+            "overview", prefix=PREFIX, version=VERSION, stream_profile=STREAM_PROFILE
+        )
+        view = HelpView(prefix=PREFIX, version=VERSION, stream_profile=STREAM_PROFILE)
+        try:
+            await ctx.send(embed=embed, view=view)
+        except Exception:
+            # Some channels or contexts may not allow views; fall back to plain embed
+            await ctx.send(embed=embed)
+        logger.info("New Help UI sent successfully (text help)")
+    except Exception as e:
+        logger.error("Help UI (text) failed with error: %s", e, exc_info=True)
+        try:
+            embed = discord.Embed(
+                title="Monica Bot — Help",
+                color=0x5865F2,
+                description="Các nhóm lệnh chính",
+            )
+            embed.add_field(name="Phát nhạc", value="/join • /play <query> • /pause • /resume • /skip • /stop • /leave", inline=False)
+            embed.add_field(name="Hàng đợi", value="/queue • /clear <tên> • /clear_all • /reverse", inline=False)
+            embed.add_field(name="Loop / Lịch sử", value="/loop (loop 1 bài) • /loop_all (loop hàng đợi) • /unloop (tắt cả hai) • /reverse", inline=False)
+            embed.add_field(name="Thông tin / Giám sát", value="/now • /stats • /health • /metrics • /version", inline=False)
+            embed.add_field(name="Cấu hình / Debug", value="/profile • /volume • /debug_track <query> • /config_show", inline=False)
+            embed.add_field(name="Báo cáo", value="/report (hoặc !report) để mở form gửi lỗi / góp ý", inline=False)
+            embed.add_field(name="Nguồn hỗ trợ", value="YouTube • SoundCloud • Bandcamp • Mixcloud • Audius", inline=False)
+            await ctx.send(embed=embed)
+        except Exception:
+            pass
 
 
 @tree.command(name="report", description="Gửi báo cáo lỗi bạn đang gặp phải")
@@ -941,8 +981,8 @@ async def handle_play_request(ctx_or_interaction, query: str):
         # Random search messages để tạo surprise và thân thiện
         search_messages = [
             {
-                "title": "🔍 Monica đang tìm kiếm...",
-                "desc": "🧐 Đang khám phá kho nhạc khổng lồ để tìm cho bạn bài phù hợp nhất! ✨"
+                "title": "🔍 Ở đâu vậy ta...",
+                "desc": "🧐 Mình đang khám phá kho nhạc khổng lồ để tìm cho bạn bài phù hợp nhất đây ✨"
             },
             {
                 "title": "🎯 Đang truy tìm bản nhạc...",
@@ -958,7 +998,7 @@ async def handle_play_request(ctx_or_interaction, query: str):
             },
             {
                 "title": "🎨 Đang vẽ nên giai điệu...",
-                "desc": "🖌️ Chờ Monica một chút nhé 🎼"
+                "desc": "🖌️ Bạn chờ Monica một chút nhé 🎼"
             }
         ]
         
@@ -967,10 +1007,10 @@ async def handle_play_request(ctx_or_interaction, query: str):
         
         ack_embed = discord.Embed(
             title=selected_msg["title"],
-            description=f"**🎵 Đang tìm:** {truncate(query, 80)}\n\n{selected_msg['desc']}\n\n⏱️ *Chỉ cần vài giây thôi, bạn kiên nhẫn nhé!* 💕",
+            description=f"**🎵 Tên bài nhạc:** {truncate(query, 80)}\n\n{selected_msg['desc']}\n\n⏱️ *Chỉ cần vài giây thôi, bạn kiên nhẫn nhé!* 💕",
             color=THEME_COLOR,
         )
-        ack_embed.set_footer(text=f"✨ Monica {VERSION} • 🎧 Mang âm nhạc đến mọi nơi!")
+        ack_embed.set_footer(text=f"✨ Monica {VERSION} • Official Music Bot for Hội người lười｡ﾟ(ﾟ´ω`ﾟ)ﾟ｡")
         if isinstance(ctx_or_interaction, discord.Interaction):
             # For deferred interactions, use followup
             try:
@@ -1293,7 +1333,7 @@ def _format_stats(guild: Optional[discord.Guild] = None) -> str:
             f"Loop one: {p.loop_one}",
             f"Current: {truncate((p.current or {}).get('title'), 60) if p.current else 'None'}",
         ])
-    return "\n".join([l for l in lines if l])
+    return "\n".join([line for line in lines if line])
 
 @bot.command(name="stats")
 async def text_stats(ctx):
@@ -1344,7 +1384,7 @@ async def text_health(ctx):
             lines.append(f"Circuit: events={ms.get('resolve_circuit_open_events')} total_open_time={ms.get('resolve_circuit_open_seconds_total_seconds', 0.0):.2f}s")
         except Exception:
             pass
-    await ctx.send(f"```\n" + "\n".join([l for l in lines if l]) + "\n```")
+    await ctx.send("```\n" + "\n".join([line for line in lines if line]) + "\n```")
 
 @tree.command(name="health", description="Chẩn đoán nhanh (voice/queue/cache)")
 async def slash_health(interaction: discord.Interaction):
@@ -1379,7 +1419,7 @@ async def slash_health(interaction: discord.Interaction):
     lines.append(f"Profile: {STREAM_PROFILE}")
     lines.append(f"Idle disconnect: {IDLE_DISCONNECT_SECONDS}s")
     lines.append(f"Prefetch: resolved={ms.get('prefetch_resolved')} idle_cycles={ms.get('prefetch_idle_cycles')}")
-    await interaction.response.send_message(f"```\n" + "\n".join([l for l in lines if l]) + "\n```", ephemeral=True)
+    await interaction.response.send_message("```\n" + "\n".join([line for line in lines if line]) + "\n```", ephemeral=True)
 
 @bot.command(name="version")
 async def text_version(ctx):
@@ -1401,7 +1441,7 @@ async def text_metrics(ctx):
     lines.append(f"resolve_time_avg_seconds: {avg:.3f}")
     if 'resolve_circuit_open_seconds_total_seconds' in ms:
         lines.append(f"resolve_circuit_open_total_seconds: {ms.get('resolve_circuit_open_seconds_total_seconds')}")
-    await ctx.send(f"```\n" + "\n".join(lines) + "\n```")
+    await ctx.send("```\n" + "\n".join(lines) + "\n```")
 
 @tree.command(name="metrics", description="Hiện các metrics nội bộ giúp debug")
 async def slash_metrics(interaction: discord.Interaction):
@@ -1411,7 +1451,7 @@ async def slash_metrics(interaction: discord.Interaction):
     for k, v in sorted(ms.items()):
         lines.append(f"{k}: {v}")
     lines.append(f"resolve_time_avg_seconds: {avg:.3f}")
-    await interaction.response.send_message(f"```\n" + "\n".join(lines) + "\n```", ephemeral=True)
+    await interaction.response.send_message("```\n" + "\n".join(lines) + "\n```", ephemeral=True)
 
 @bot.command(name="debug_track")
 async def text_debug_track(ctx, *, query: str):

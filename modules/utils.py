@@ -1,12 +1,11 @@
 """
 Utility functions for Monica Bot
 """
-import time
 import json
 import os
 import logging
 import asyncio
-from typing import Optional, Dict, Any
+from typing import Optional
 
 logger = logging.getLogger("Monica.Utils")
 
@@ -45,7 +44,7 @@ def make_progress_bar(elapsed: float, total: Optional[float], width: int = 18) -
 def write_snapshot_file(snap: dict):
     """Blocking atomic write of snapshot to disk (use in executor or sync contexts)."""
     try:
-        tmp = f"queues_snapshot.json.tmp"
+        tmp = "queues_snapshot.json.tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(snap, f, ensure_ascii=False, indent=2)
             f.flush()
