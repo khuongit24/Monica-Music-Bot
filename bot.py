@@ -73,7 +73,7 @@ STREAM_PROFILE: str = str(CONFIG.get("stream_profile", "stable")).lower().strip(
 NOW_UPDATE_INTERVAL: int = max(5, int(CONFIG.get("now_update_interval_seconds", 12)))
 PRESENCE_TEXT: str = str(CONFIG.get("presence_text", "/help hoặc /play để bắt đầu ✨"))
 PRESENCE_TYPE: str = str(CONFIG.get("presence_type", "listening")).lower()
-VERSION: str = "v3.9.6-prerelease"  # prerelease tag for testing
+VERSION: str = "v3.9.6" 
 GIT_COMMIT: Optional[str] = os.getenv("GIT_COMMIT") or os.getenv("COMMIT_SHA") or None
 
 # Playbook modes & Spotify removed. Supported sources only.
@@ -1517,8 +1517,18 @@ async def slash_config_show(interaction: discord.Interaction):
 
 @tree.command(name="reload_config", description="Nạp lại một số config động (admin)")
 async def slash_reload_config(interaction: discord.Interaction):
-    if interaction.user.id != OWNER_ID:
-        await interaction.response.send_message("Bạn không có quyền", ephemeral=True); return
+    # Permission check: allow explicit OWNER_ID, guild Manage Guild, or the application owner.
+    is_owner = OWNER_ID is not None and interaction.user.id == OWNER_ID
+    # guild_permissions exists when the interaction is in a guild; guard with getattr
+    has_admin = getattr(interaction.user, "guild_permissions", None) and interaction.user.guild_permissions.manage_guild
+    try:
+        app_owner = (await bot.application_info()).owner
+    except Exception:
+        app_owner = None
+    is_app_owner = interaction.user.id == getattr(app_owner, "id", 0)
+    if not (is_owner or has_admin or is_app_owner):
+        await interaction.response.send_message("Bạn không có quyền", ephemeral=True)
+        return
     changed = []
     try:
         from modules.config import load_config as _lc
